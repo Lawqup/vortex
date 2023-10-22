@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow;
 use vortex::*;
 
@@ -5,10 +7,18 @@ use vortex::*;
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum BroadcastPayload {
-    Broadcast { message: u64 },
+    Broadcast {
+        message: u64,
+    },
     BroadcastOk,
     Read,
-    ReadOk { messages: Vec<u64> },
+    ReadOk {
+        messages: Vec<u64>,
+    },
+    Topology {
+        topology: HashMap<String, Vec<String>>,
+    },
+    TopologyOk,
 }
 struct BroadcastService {
     msg_id: u64,
@@ -28,27 +38,33 @@ impl Service<BroadcastPayload> for BroadcastService {
                 output
                     .reply(
                         input.src,
-                        Some(self.msg_id),
+                        Some(&mut self.msg_id),
                         input.body.msg_id,
                         BroadcastPayload::BroadcastOk,
                     )
                     .context("Broadcast reply")?;
-
-                self.msg_id += 1;
             }
             BroadcastPayload::Read => {
                 output
                     .reply(
                         input.src,
-                        Some(self.msg_id),
+                        Some(&mut self.msg_id),
                         input.body.msg_id,
                         BroadcastPayload::ReadOk {
                             messages: self.store.clone(),
                         },
                     )
                     .context("Read reply")?;
-
-                self.msg_id += 1;
+            }
+            BroadcastPayload::Topology { .. } => {
+                output
+                    .reply(
+                        input.src,
+                        Some(&mut self.msg_id),
+                        input.body.msg_id,
+                        BroadcastPayload::TopologyOk,
+                    )
+                    .context("Read reply")?;
             }
             _ => {}
         }
@@ -56,22 +72,6 @@ impl Service<BroadcastPayload> for BroadcastService {
         Ok(())
     }
 }
-
-/*
-{
-  "src": "c1",
-  "dest": "n1",
-  "body": {
-    "type":     "init",
-    "msg_id":   1,
-    "node_id":  "n3",
-    "node_ids": ["n1", "n2", "n3"]
-  }
-}
-
-
-
- */
 
 fn main() -> anyhow::Result<()> {
     let output = initialize().context("Initialize node")?;

@@ -41,7 +41,7 @@ impl Output {
     pub fn reply<Payload: Serialize + Clone>(
         &mut self,
         dest: String,
-        msg_id: Option<u64>,
+        msg_id: Option<&mut u64>,
         in_reply_to: Option<u64>,
         payload: Payload,
     ) -> anyhow::Result<()> {
@@ -49,7 +49,11 @@ impl Output {
             src: self.node_id.clone(),
             dest,
             body: Body {
-                msg_id,
+                msg_id: msg_id.map(|id| {
+                    let prev = *id;
+                    *id += 1;
+                    prev
+                }),
                 in_reply_to,
                 payload,
             },

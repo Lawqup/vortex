@@ -26,15 +26,13 @@ impl Service<GeneratePayload> for GenerateService {
         output
             .reply(
                 input.src,
-                Some(self.msg_id),
+                Some(&mut self.msg_id),
                 input.body.msg_id,
                 GeneratePayload::GenerateOk {
                     uuid: Ulid::new().to_string(),
                 },
             )
             .context("Generate reply")?;
-
-        self.msg_id += 1;
         Ok(())
     }
 }

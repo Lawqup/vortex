@@ -22,13 +22,11 @@ impl Service<EchoPayload> for EchoService {
         output
             .reply(
                 input.src,
-                Some(self.msg_id),
+                Some(&mut self.msg_id),
                 input.body.msg_id,
                 EchoPayload::EchoOk { echo: echo.clone() },
             )
             .context("Echo reply")?;
-
-        self.msg_id += 1;
         Ok(())
     }
 }
