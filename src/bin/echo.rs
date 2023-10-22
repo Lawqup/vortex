@@ -32,9 +32,7 @@ impl Service<EchoPayload> for EchoService {
 }
 
 fn main() -> anyhow::Result<()> {
-    let init = initialize().context("Initialize node")?;
-
     let echo = EchoService { msg_id: 0 };
 
-    echo.run(init).context("Run echo service")
+    echo.run().context("Run echo service")
 }

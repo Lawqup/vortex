@@ -34,7 +34,7 @@ enum InitPayload {
 pub struct Output {
     output: StdoutLock<'static>,
     node_id: String,
-    node_ids: Vec<String>,
+    neighbors: Vec<String>,
 }
 
 impl Output {
@@ -83,41 +83,12 @@ impl Output {
         &mut self,
         body: Body<Payload>,
     ) -> anyhow::Result<()> {
-        for dest in self.node_ids.clone() {
+        for dest in self.neighbors.clone() {
             self.send(dest, body.clone())
                 .context("Send message while broadcasting")?;
         }
         Ok(())
     }
-}
-
-pub fn initialize() -> anyhow::Result<Output> {
-    let stdin = std::io::stdin().lock();
-    let mut input =
-        serde_json::Deserializer::from_reader(stdin).into_iter::<Message<InitPayload>>();
-
-    let init = input
-        .next()
-        .expect("input will block until next message")
-        .context("Deserialize init message")?;
-
-    // Initialize state
-    let (node_id, node_ids) = match &init.body.payload {
-        InitPayload::Init { node_id, node_ids } => (node_id.clone(), node_ids.clone()),
-        _ => bail!("First message should have been an init message"),
-    };
-
-    let mut output = Output {
-        output: std::io::stdout().lock(),
-        node_id,
-        node_ids,
-    };
-
-    output
-        .reply(init.src, None, init.body.msg_id, InitPayload::InitOk)
-        .context("Init reply")?;
-
-    Ok(output)
 }
 
 pub trait Service<Payload>: Sized
@@ -126,8 +97,33 @@ where
 {
     fn step(&mut self, input: Message<Payload>, output: &mut Output) -> anyhow::Result<()>;
 
-    fn run(mut self, mut output: Output) -> anyhow::Result<()> {
-        let stdin = std::io::stdin().lock();
+    fn run(mut self) -> anyhow::Result<()> {
+        let mut stdin = std::io::stdin().lock();
+
+        let mut input =
+            serde_json::Deserializer::from_reader(&mut stdin).into_iter::<Message<InitPayload>>();
+
+        let init = input
+            .next()
+            .expect("input will block until next message")
+            .context("Deserialize init message")?;
+
+        // Initialize state
+        let (node_id, _node_ids) = match &init.body.payload {
+            InitPayload::Init { node_id, node_ids } => (node_id.clone(), node_ids.clone()),
+            _ => bail!("First message should have been an init message"),
+        };
+
+        let mut output = Output {
+            output: std::io::stdout().lock(),
+            node_id,
+            neighbors: Vec::new(),
+        };
+
+        output
+            .reply(init.src, None, init.body.msg_id, InitPayload::InitOk)
+            .context("Init reply")?;
+
         let input = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
 
         for msg in input {
@@ -138,3 +134,18 @@ where
         Ok(())
     }
 }
+
+/*
+
+{
+  "src": "c1",
+  "dest": "n1",
+  "body": {
+    "type": "init",
+    "msg_id": 1,
+    "node_id": "n3",
+    "node_ids": ["n1", "n2", "n3"]
+  }
+}
+
+ */

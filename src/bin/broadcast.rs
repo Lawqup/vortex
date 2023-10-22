@@ -74,12 +74,10 @@ impl Service<BroadcastPayload> for BroadcastService {
 }
 
 fn main() -> anyhow::Result<()> {
-    let output = initialize().context("Initialize node")?;
-
     let broadcast = BroadcastService {
         msg_id: 0,
         store: Vec::new(),
     };
 
-    broadcast.run(output).context("Run generate service")
+    broadcast.run().context("Run generate service")
 }

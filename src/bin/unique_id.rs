@@ -38,9 +38,7 @@ impl Service<GeneratePayload> for GenerateService {
 }
 
 fn main() -> anyhow::Result<()> {
-    let init = initialize().context("Initialize node")?;
-
     let generate = GenerateService { msg_id: 0 };
 
-    generate.run(init).context("Run generate service")
+    generate.run().context("Run generate service")
 }
