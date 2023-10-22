@@ -1,4 +1,5 @@
 pub use anyhow::Context;
+use serde::de::DeserializeOwned;
 pub use serde::{Deserialize, Serialize};
 pub use std::io::{StdoutLock, Write};
 
@@ -95,7 +96,7 @@ pub fn initialize() -> anyhow::Result<Init> {
 
 pub trait Service<Payload>: Sized
 where
-    Payload: Deserialize<'static>,
+    Payload: DeserializeOwned,
 {
     fn step(&mut self, input: Message<Payload>, output: &mut Output) -> anyhow::Result<()>;
 
