@@ -9,7 +9,7 @@ enum EchoPayload {
 }
 
 struct EchoService {
-    id: u64,
+    msg_id: u64,
 }
 
 impl Service<EchoPayload> for EchoService {
@@ -19,23 +19,24 @@ impl Service<EchoPayload> for EchoService {
             _ => return Ok(()),
         };
 
-        let body = Body {
-            msg_id: Some(self.id),
-            in_reply_to: input.body.msg_id,
-            payload: EchoPayload::EchoOk { echo: echo.clone() },
-        };
+        output
+            .reply(
+                input.src,
+                Some(self.msg_id),
+                input.body.msg_id,
+                EchoPayload::EchoOk { echo: echo.clone() },
+            )
+            .context("Echo reply")?;
 
-        self.id += 1;
-
-        output.reply(input, body).context("Echo reply")?;
+        self.msg_id += 1;
         Ok(())
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let _ = initialize().context("Initialize node")?;
+    let init = initialize().context("Initialize node")?;
 
-    let echo = EchoService { id: 0 };
+    let echo = EchoService { msg_id: 0 };
 
-    echo.run().context("Run echo service")
+    echo.run(init).context("Run echo service")
 }

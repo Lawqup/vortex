@@ -6,14 +6,14 @@ pub use std::io::{StdoutLock, Write};
 use anyhow::bail;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Message<Payload> {
+pub struct Message<Payload: Clone> {
     pub src: String,
     pub dest: String,
     pub body: Body<Payload>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Body<Payload> {
+pub struct Body<Payload: Clone> {
     pub msg_id: Option<u64>,
     pub in_reply_to: Option<u64>,
     #[serde(flatten)]
@@ -31,39 +31,63 @@ enum InitPayload {
     InitOk,
 }
 
-#[derive(Debug)]
-pub struct Init {
-    pub node_id: String,
-    pub node_ids: Vec<String>,
-}
-
 pub struct Output {
     output: StdoutLock<'static>,
+    node_id: String,
+    node_ids: Vec<String>,
 }
 
 impl Output {
-    pub fn reply<MP, BP: Serialize>(
+    pub fn reply<Payload: Serialize + Clone>(
         &mut self,
-        msg: Message<MP>,
-        body: Body<BP>,
+        dest: String,
+        msg_id: Option<u64>,
+        in_reply_to: Option<u64>,
+        payload: Payload,
     ) -> anyhow::Result<()> {
         let reply = Message {
-            src: msg.dest,
-            dest: msg.src,
-            body,
+            src: self.node_id.clone(),
+            dest,
+            body: Body {
+                msg_id,
+                in_reply_to,
+                payload,
+            },
         };
 
         serde_json::to_writer(&mut self.output, &reply).context("Serialize reply")?;
         self.output.write_all(b"\n")?;
         Ok(())
     }
+
+    pub fn send<Payload: Serialize + Clone>(
+        &mut self,
+        dest: String,
+        body: Body<Payload>,
+    ) -> anyhow::Result<()> {
+        let reply = Message {
+            src: self.node_id.clone(),
+            dest,
+            body,
+        };
+        serde_json::to_writer(&mut self.output, &reply).context("Serialize message")?;
+        self.output.write_all(b"\n")?;
+        Ok(())
+    }
+
+    pub fn broadcast<Payload: Serialize + Clone>(
+        &mut self,
+        body: Body<Payload>,
+    ) -> anyhow::Result<()> {
+        for dest in self.node_ids.clone() {
+            self.send(dest, body.clone())
+                .context("Send message while broadcasting")?;
+        }
+        Ok(())
+    }
 }
 
-pub fn initialize() -> anyhow::Result<Init> {
-    let mut output = Output {
-        output: std::io::stdout().lock(),
-    };
-
+pub fn initialize() -> anyhow::Result<Output> {
     let stdin = std::io::stdin().lock();
     let mut input =
         serde_json::Deserializer::from_reader(stdin).into_iter::<Message<InitPayload>>();
@@ -79,32 +103,26 @@ pub fn initialize() -> anyhow::Result<Init> {
         _ => bail!("First message should have been an init message"),
     };
 
-    let msg_id = init.body.msg_id;
+    let mut output = Output {
+        output: std::io::stdout().lock(),
+        node_id,
+        node_ids,
+    };
+
     output
-        .reply(
-            init,
-            Body {
-                msg_id: None,
-                in_reply_to: msg_id,
-                payload: InitPayload::InitOk,
-            },
-        )
+        .reply(init.src, None, init.body.msg_id, InitPayload::InitOk)
         .context("Init reply")?;
 
-    Ok(Init { node_id, node_ids })
+    Ok(output)
 }
 
 pub trait Service<Payload>: Sized
 where
-    Payload: DeserializeOwned,
+    Payload: DeserializeOwned + Clone,
 {
     fn step(&mut self, input: Message<Payload>, output: &mut Output) -> anyhow::Result<()>;
 
-    fn run(mut self) -> anyhow::Result<()> {
-        let mut output = Output {
-            output: std::io::stdout().lock(),
-        };
-
+    fn run(mut self, mut output: Output) -> anyhow::Result<()> {
         let stdin = std::io::stdin().lock();
         let input = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
 

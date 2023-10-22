@@ -23,25 +23,26 @@ impl Service<GeneratePayload> for GenerateService {
             _ => return Ok(()),
         };
 
-        let body = Body {
-            msg_id: Some(self.msg_id),
-            in_reply_to: input.body.msg_id,
-            payload: GeneratePayload::GenerateOk {
-                uuid: Ulid::new().to_string(),
-            },
-        };
+        output
+            .reply(
+                input.src,
+                Some(self.msg_id),
+                input.body.msg_id,
+                GeneratePayload::GenerateOk {
+                    uuid: Ulid::new().to_string(),
+                },
+            )
+            .context("Generate reply")?;
 
         self.msg_id += 1;
-
-        output.reply(input, body).context("Generate reply")?;
         Ok(())
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let _ = initialize().context("Initialize node")?;
+    let init = initialize().context("Initialize node")?;
 
     let generate = GenerateService { msg_id: 0 };
 
-    generate.run().context("Run generate service")
+    generate.run(init).context("Run generate service")
 }
