@@ -13,20 +13,29 @@ enum GeneratePayload {
 }
 
 struct GenerateService {
-    msg_id: u64,
+    msg_id: IdCounter,
 }
 
 impl Service<GeneratePayload> for GenerateService {
-    fn step(&mut self, input: Message<GeneratePayload>, output: &mut Output) -> anyhow::Result<()> {
+    fn create(_sender: std::sync::mpsc::Sender<Event<GeneratePayload>>) -> Self {
+        Self {
+            msg_id: IdCounter::new(),
+        }
+    }
+    fn step(&mut self, event: Event<GeneratePayload>, network: &mut Network) -> anyhow::Result<()> {
+        let Event::Message(input) = event else {
+            panic!("Echo should only recieve messages");
+        };
+
         match &input.body.payload {
             GeneratePayload::Generate => {}
             _ => return Ok(()),
         };
 
-        output
+        network
             .reply(
                 input.src,
-                Some(&mut self.msg_id),
+                self.msg_id.next(),
                 input.body.msg_id,
                 GeneratePayload::GenerateOk {
                     uuid: Ulid::new().to_string(),
@@ -38,7 +47,5 @@ impl Service<GeneratePayload> for GenerateService {
 }
 
 fn main() -> anyhow::Result<()> {
-    let generate = GenerateService { msg_id: 0 };
-
-    generate.run().context("Run generate service")
+    GenerateService::run().context("Run generate service")
 }

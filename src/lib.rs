@@ -2,8 +2,18 @@ pub use anyhow::Context;
 use serde::de::DeserializeOwned;
 pub use serde::{Deserialize, Serialize};
 pub use std::io::{StdoutLock, Write};
+use std::{
+    sync::mpsc::{self, Sender},
+    thread,
+};
 
 use anyhow::bail;
+
+pub enum Event<Payload: Clone, Signal = ()> {
+    Message(Message<Payload>),
+    Signal(Signal),
+    EOF,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Message<Payload: Clone> {
@@ -31,17 +41,17 @@ enum InitPayload {
     InitOk,
 }
 
-pub struct Output {
+pub struct Network {
     output: StdoutLock<'static>,
-    node_id: String,
-    neighbors: Vec<String>,
+    pub node_id: String,
+    pub neighbors: Vec<String>,
 }
 
-impl Output {
+impl Network {
     pub fn reply<Payload: Serialize + Clone>(
         &mut self,
         dest: String,
-        msg_id: Option<&mut u64>,
+        msg_id: Option<u64>,
         in_reply_to: Option<u64>,
         payload: Payload,
     ) -> anyhow::Result<()> {
@@ -49,11 +59,7 @@ impl Output {
             src: self.node_id.clone(),
             dest,
             body: Body {
-                msg_id: msg_id.map(|id| {
-                    let prev = *id;
-                    *id += 1;
-                    prev
-                }),
+                msg_id,
                 in_reply_to,
                 payload,
             },
@@ -91,13 +97,32 @@ impl Output {
     }
 }
 
-pub trait Service<Payload>: Sized
-where
-    Payload: DeserializeOwned + Clone,
-{
-    fn step(&mut self, input: Message<Payload>, output: &mut Output) -> anyhow::Result<()>;
+pub struct IdCounter(u64);
 
-    fn run(mut self) -> anyhow::Result<()> {
+impl IdCounter {
+    pub fn new() -> Self {
+        Self(0)
+    }
+    pub fn next(&mut self) -> Option<u64> {
+        let prev = self.0;
+        self.0 += 1;
+        Some(prev)
+    }
+    pub fn peek(&mut self) -> u64 {
+        self.0
+    }
+}
+
+pub trait Service<Payload, Signal = ()>: Sized
+where
+    Payload: DeserializeOwned + Send + Clone + 'static,
+    Signal: Send + 'static,
+{
+    fn create(sender: Sender<Event<Payload, Signal>>) -> Self;
+
+    fn step(&mut self, input: Event<Payload, Signal>, network: &mut Network) -> anyhow::Result<()>;
+
+    fn run() -> anyhow::Result<()> {
         let mut stdin = std::io::stdin().lock();
 
         let mut input =
@@ -114,22 +139,48 @@ where
             _ => bail!("First message should have been an init message"),
         };
 
-        let mut output = Output {
+        let mut network = Network {
             output: std::io::stdout().lock(),
             node_id,
             neighbors: Vec::new(),
         };
 
-        output
+        let (sender, receiver) = mpsc::channel();
+
+        network
             .reply(init.src, None, init.body.msg_id, InitPayload::InitOk)
             .context("Init reply")?;
 
-        let input = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
+        drop(stdin);
+        let sender_clone = sender.clone();
+        let handle = thread::spawn(move || {
+            let stdin = std::io::stdin().lock();
+            let input =
+                serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
 
-        for msg in input {
-            let msg = msg.context("Deserialize messge")?;
-            self.step(msg, &mut output)?;
+            for msg in input {
+                let msg = msg.context("Deserialize messge")?;
+
+                // If connection is closed, wrap things up
+                if let Err(_) = sender_clone.send(Event::Message(msg)) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+
+            let _ = sender_clone.send(Event::EOF);
+
+            Ok(())
+        });
+
+        let mut service = Self::create(sender);
+        for event in receiver {
+            service.step(event, &mut network)?;
         }
+
+        handle
+            .join()
+            .expect("Stdin reader thread panicked")
+            .context("Stdin reader thread err")?;
 
         Ok(())
     }

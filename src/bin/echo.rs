@@ -9,20 +9,29 @@ enum EchoPayload {
 }
 
 struct EchoService {
-    msg_id: u64,
+    msg_id: IdCounter,
 }
 
 impl Service<EchoPayload> for EchoService {
-    fn step(&mut self, input: Message<EchoPayload>, output: &mut Output) -> anyhow::Result<()> {
+    fn create(_sender: std::sync::mpsc::Sender<Event<EchoPayload>>) -> Self {
+        Self {
+            msg_id: IdCounter::new(),
+        }
+    }
+    fn step(&mut self, event: Event<EchoPayload>, network: &mut Network) -> anyhow::Result<()> {
+        let Event::Message(input) = event else {
+            panic!("Echo should only recieve messages");
+        };
+
         let echo = match &input.body.payload {
             EchoPayload::Echo { echo } => echo,
             _ => return Ok(()),
         };
 
-        output
+        network
             .reply(
                 input.src,
-                Some(&mut self.msg_id),
+                self.msg_id.next(),
                 input.body.msg_id,
                 EchoPayload::EchoOk { echo: echo.clone() },
             )
@@ -32,7 +41,5 @@ impl Service<EchoPayload> for EchoService {
 }
 
 fn main() -> anyhow::Result<()> {
-    let echo = EchoService { msg_id: 0 };
-
-    echo.run().context("Run echo service")
+    EchoService::run().context("Run echo service")
 }
