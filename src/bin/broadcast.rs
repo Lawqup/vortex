@@ -47,11 +47,37 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
     ) -> Self {
         thread::spawn(move || loop {
             // TODO: try smaller
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(150));
             if let Err(_) = sender.send(Event::Signal(BroadcastSignal::Gossip)) {
                 return Ok::<_, anyhow::Error>(());
             }
         });
+
+        // sqrt(n) root nodes, all with sqrt(n)-1 children
+        // Each child connects to all the root nodes
+
+        let root_nodes = (network.all_nodes.len() as f64).sqrt() as usize;
+
+        let idx = network
+            .all_nodes
+            .iter()
+            .position(|n| n == &network.node_id)
+            .unwrap_or_else(|| panic!("Node {} is unknown", network.node_id));
+
+        network.neighbors = if idx % root_nodes == 0 {
+            // Node is a root node
+            (idx + 1..(idx + root_nodes).min(network.all_nodes.len()))
+                .map(|i| network.all_nodes[i].clone())
+                .collect()
+        } else {
+            // Node is a child node
+            (0..network.all_nodes.len())
+                .filter(|i| i % root_nodes == 0)
+                .map(|i| network.all_nodes[i].clone())
+                .collect()
+        };
+
+        eprintln!("{}:{:?}", network.node_id, network.neighbors);
 
         Self {
             msg_id: IdCounter::new(),
@@ -87,14 +113,12 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
                             // Thus, B never tells A it knows 1,2,3
                             //
                             // So, send a random fixed-size subset elements of what is
-                            // already known
+                            // already known to let A know B knows
 
                             let mut rng = rand::thread_rng();
                             to_send.extend(known.iter().copied().filter(|_| {
                                 rng.gen_ratio(10.min(known.len() as u32), known.len() as u32)
                             }));
-
-                            eprintln!("{}/{}", to_send.len(), self.messages.len());
                             network
                                 .send(
                                     neighbor.clone(),
@@ -134,10 +158,12 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
                         )
                         .context("Read reply")?;
                 }
-                BroadcastPayload::Topology { mut topology } => {
-                    network.neighbors = topology
-                        .remove(&network.node_id)
-                        .expect("Topology should contain information for all nodes");
+                BroadcastPayload::Topology { topology: _ } => {
+                    // Implement our own topology
+
+                    // network.neighbors = topology
+                    //     .remove(&network.node_id)
+                    //     .expect("Topology should contain information for all nodes");
 
                     network
                         .reply(
