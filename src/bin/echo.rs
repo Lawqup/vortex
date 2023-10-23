@@ -13,7 +13,10 @@ struct EchoService {
 }
 
 impl Service<EchoPayload> for EchoService {
-    fn create(_sender: std::sync::mpsc::Sender<Event<EchoPayload>>) -> Self {
+    fn create(
+        _network: &mut Network,
+        _sender: std::sync::mpsc::Sender<Event<EchoPayload>>,
+    ) -> Self {
         Self {
             msg_id: IdCounter::new(),
         }

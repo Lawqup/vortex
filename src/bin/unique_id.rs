@@ -17,7 +17,10 @@ struct GenerateService {
 }
 
 impl Service<GeneratePayload> for GenerateService {
-    fn create(_sender: std::sync::mpsc::Sender<Event<GeneratePayload>>) -> Self {
+    fn create(
+        _network: &mut Network,
+        _sender: std::sync::mpsc::Sender<Event<GeneratePayload>>,
+    ) -> Self {
         Self {
             msg_id: IdCounter::new(),
         }

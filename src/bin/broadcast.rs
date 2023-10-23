@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use anyhow;
+use rand::Rng;
 use vortex::*;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -22,6 +25,9 @@ enum BroadcastPayload {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk,
+    Gossip {
+        known: HashSet<u64>,
+    },
 }
 
 enum BroadcastSignal {
@@ -32,16 +38,30 @@ struct BroadcastService {
     msg_id: IdCounter,
     messages: HashSet<u64>,
     known: HashMap<String, HashSet<u64>>,
-    messages_sent: HashMap<u64, u64>,
 }
 
 impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
-    fn create(sender: mpsc::Sender<Event<BroadcastPayload, BroadcastSignal>>) -> Self {
+    fn create(
+        network: &mut Network,
+        sender: mpsc::Sender<Event<BroadcastPayload, BroadcastSignal>>,
+    ) -> Self {
+        thread::spawn(move || loop {
+            // TODO: try smaller
+            thread::sleep(Duration::from_millis(300));
+            if let Err(_) = sender.send(Event::Signal(BroadcastSignal::Gossip)) {
+                return Ok::<_, anyhow::Error>(());
+            }
+        });
+
         Self {
             msg_id: IdCounter::new(),
             messages: HashSet::new(),
-            known: HashMap::new(),
-            messages_sent: HashMap::new(),
+            known: network
+                .all_nodes
+                .clone()
+                .into_iter()
+                .map(|id| (id, HashSet::new()))
+                .collect(),
         }
     }
     fn step(
@@ -50,87 +70,94 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
         network: &mut Network,
     ) -> anyhow::Result<()> {
         match event {
-            Event::Signal(_) => todo!(),
             Event::EOF => todo!(),
-            Event::Message(msg) => {
-                match msg.body.payload {
-                    BroadcastPayload::Broadcast { message } => {
-                        self.messages.insert(message);
-
-                        network
-                            .reply(
-                                msg.src,
-                                self.msg_id.next(),
-                                msg.body.msg_id,
-                                BroadcastPayload::BroadcastOk,
-                            )
-                            .context("Broadcast reply")?;
-
+            Event::Signal(signal) => {
+                match signal {
+                    BroadcastSignal::Gossip => {
                         for neighbor in network.neighbors.clone() {
-                            if neighbor != network.node_id
-                                && !self
-                                    .known
-                                    .get(&neighbor)
-                                    .is_some_and(|known| known.contains(&message))
-                            {
-                                let forward = Body {
-                                    msg_id: self.msg_id.next(),
-                                    in_reply_to: None,
-                                    payload: BroadcastPayload::Broadcast { message },
-                                };
+                            let known_to_neighbor = &self.known[&neighbor];
+                            let (known, mut to_send): (HashSet<_>, HashSet<_>) = self
+                                .messages
+                                .iter()
+                                .copied()
+                                .partition(|msg| known_to_neighbor.contains(msg));
 
-                                self.messages_sent.insert(self.msg_id.peek(), message);
+                            // A tells B it knows 1,2,3
+                            // B now knows A knows 1,2,3
+                            // Thus, B never tells A it knows 1,2,3
+                            //
+                            // So, send a random fixed-size subset elements of what is
+                            // already known
 
-                                network
-                                    .send(neighbor, forward)
-                                    .context("Broadcast forward")?;
-                            }
+                            let mut rng = rand::thread_rng();
+                            to_send.extend(known.iter().copied().filter(|_| {
+                                rng.gen_ratio(10.min(known.len() as u32), known.len() as u32)
+                            }));
+
+                            eprintln!("{}/{}", to_send.len(), self.messages.len());
+                            network
+                                .send(
+                                    neighbor.clone(),
+                                    Body {
+                                        msg_id: None,
+                                        in_reply_to: None,
+                                        payload: BroadcastPayload::Gossip { known: to_send },
+                                    },
+                                )
+                                .context("Sending gossip message")?;
                         }
                     }
-                    BroadcastPayload::Read => {
-                        network
-                            .reply(
-                                msg.src,
-                                self.msg_id.next(),
-                                msg.body.msg_id,
-                                BroadcastPayload::ReadOk {
-                                    messages: self.messages.clone(),
-                                },
-                            )
-                            .context("Read reply")?;
-                    }
-                    BroadcastPayload::Topology { mut topology } => {
-                        network.neighbors = topology
-                            .remove(&network.node_id)
-                            .expect("Topology should contain information for all nodes");
-
-                        network
-                            .reply(
-                                msg.src,
-                                self.msg_id.next(),
-                                msg.body.msg_id,
-                                BroadcastPayload::TopologyOk,
-                            )
-                            .context("Read reply")?;
-                    }
-                    BroadcastPayload::BroadcastOk => {
-                        let ent = self.known.entry(msg.src).or_insert(HashSet::new());
-
-                        let in_reply_to = &msg
-                            .body
-                            .msg_id
-                            .expect("BroadcastOk should have an in_reply_to");
-
-                        if let Some(sent) = self.messages_sent.get(&in_reply_to) {
-                            ent.insert(*sent);
-
-                            // Space optimization
-                            self.messages_sent.remove(&in_reply_to);
-                        }
-                    }
-                    _ => {}
                 }
             }
+            Event::Message(msg) => match msg.body.payload {
+                BroadcastPayload::Broadcast { message } => {
+                    self.messages.insert(message);
+
+                    network
+                        .reply(
+                            msg.src,
+                            self.msg_id.next(),
+                            msg.body.msg_id,
+                            BroadcastPayload::BroadcastOk,
+                        )
+                        .context("Broadcast reply")?;
+                }
+                BroadcastPayload::Read => {
+                    network
+                        .reply(
+                            msg.src,
+                            self.msg_id.next(),
+                            msg.body.msg_id,
+                            BroadcastPayload::ReadOk {
+                                messages: self.messages.clone(),
+                            },
+                        )
+                        .context("Read reply")?;
+                }
+                BroadcastPayload::Topology { mut topology } => {
+                    network.neighbors = topology
+                        .remove(&network.node_id)
+                        .expect("Topology should contain information for all nodes");
+
+                    network
+                        .reply(
+                            msg.src,
+                            self.msg_id.next(),
+                            msg.body.msg_id,
+                            BroadcastPayload::TopologyOk,
+                        )
+                        .context("Read reply")?;
+                }
+                BroadcastPayload::Gossip { known } => {
+                    self.known
+                        .get_mut(&msg.src)
+                        .expect("Initialized all nodes in the map at creation")
+                        .extend(known.clone());
+
+                    self.messages.extend(known);
+                }
+                _ => {}
+            },
         }
 
         Ok(())

@@ -45,6 +45,7 @@ pub struct Network {
     output: StdoutLock<'static>,
     pub node_id: String,
     pub neighbors: Vec<String>,
+    pub all_nodes: Vec<String>,
 }
 
 impl Network {
@@ -84,17 +85,6 @@ impl Network {
         self.output.write_all(b"\n")?;
         Ok(())
     }
-
-    pub fn broadcast<Payload: Serialize + Clone>(
-        &mut self,
-        body: Body<Payload>,
-    ) -> anyhow::Result<()> {
-        for dest in self.neighbors.clone() {
-            self.send(dest, body.clone())
-                .context("Send message while broadcasting")?;
-        }
-        Ok(())
-    }
 }
 
 pub struct IdCounter(u64);
@@ -118,7 +108,7 @@ where
     Payload: DeserializeOwned + Send + Clone + 'static,
     Signal: Send + 'static,
 {
-    fn create(sender: Sender<Event<Payload, Signal>>) -> Self;
+    fn create(network: &mut Network, sender: Sender<Event<Payload, Signal>>) -> Self;
 
     fn step(&mut self, input: Event<Payload, Signal>, network: &mut Network) -> anyhow::Result<()>;
 
@@ -134,7 +124,7 @@ where
             .context("Deserialize init message")?;
 
         // Initialize state
-        let (node_id, _node_ids) = match &init.body.payload {
+        let (node_id, all_nodes) = match &init.body.payload {
             InitPayload::Init { node_id, node_ids } => (node_id.clone(), node_ids.clone()),
             _ => bail!("First message should have been an init message"),
         };
@@ -143,6 +133,7 @@ where
             output: std::io::stdout().lock(),
             node_id,
             neighbors: Vec::new(),
+            all_nodes,
         };
 
         let (sender, receiver) = mpsc::channel();
@@ -172,7 +163,7 @@ where
             Ok(())
         });
 
-        let mut service = Self::create(sender);
+        let mut service = Self::create(&mut network, sender);
         for event in receiver {
             service.step(event, &mut network)?;
         }
@@ -185,18 +176,3 @@ where
         Ok(())
     }
 }
-
-/*
-
-{
-  "src": "c1",
-  "dest": "n1",
-  "body": {
-    "type": "init",
-    "msg_id": 1,
-    "node_id": "n3",
-    "node_ids": ["n1", "n2", "n3"]
-  }
-}
-
- */
