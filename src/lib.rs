@@ -85,6 +85,40 @@ impl Network {
         self.output.write_all(b"\n")?;
         Ok(())
     }
+
+    /// sqrt(n) root nodes, all with sqrt(n)-1 children
+    /// Each child connects to all the root nodes
+    pub fn set_sqrt_topology(&mut self) {
+        if self.all_nodes.len() < 4 {
+            self.set_mesh_topology();
+            return;
+        }
+
+        let root_nodes = (self.all_nodes.len() as f64).sqrt() as usize;
+
+        let idx = self
+            .all_nodes
+            .iter()
+            .position(|n| n == &self.node_id)
+            .unwrap_or_else(|| panic!("Node {} is unknown", self.node_id));
+
+        self.neighbors = if idx % root_nodes == 0 {
+            // Node is a root node
+            (idx + 1..(idx + root_nodes).min(self.all_nodes.len()))
+                .map(|i| self.all_nodes[i].clone())
+                .collect()
+        } else {
+            // Node is a child node
+            (0..self.all_nodes.len())
+                .filter(|i| i % root_nodes == 0)
+                .map(|i| self.all_nodes[i].clone())
+                .collect()
+        };
+    }
+
+    pub fn set_mesh_topology(&mut self) {
+        self.neighbors = self.all_nodes.clone();
+    }
 }
 
 pub struct IdCounter(u64);

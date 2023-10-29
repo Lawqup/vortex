@@ -53,32 +53,7 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
             }
         });
 
-        // sqrt(n) root nodes, all with sqrt(n)-1 children
-        // Each child connects to all the root nodes
-
-        let root_nodes = (network.all_nodes.len() as f64).sqrt() as usize;
-
-        let idx = network
-            .all_nodes
-            .iter()
-            .position(|n| n == &network.node_id)
-            .unwrap_or_else(|| panic!("Node {} is unknown", network.node_id));
-
-        network.neighbors = if idx % root_nodes == 0 {
-            // Node is a root node
-            (idx + 1..(idx + root_nodes).min(network.all_nodes.len()))
-                .map(|i| network.all_nodes[i].clone())
-                .collect()
-        } else {
-            // Node is a child node
-            (0..network.all_nodes.len())
-                .filter(|i| i % root_nodes == 0)
-                .map(|i| network.all_nodes[i].clone())
-                .collect()
-        };
-
-        eprintln!("{}:{:?}", network.node_id, network.neighbors);
-
+        network.set_sqrt_topology();
         Self {
             msg_id: IdCounter::new(),
             messages: HashSet::new(),
