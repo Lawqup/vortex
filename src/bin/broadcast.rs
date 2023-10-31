@@ -1,11 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::mpsc,
-    thread,
     time::Duration,
 };
 
-use anyhow;
+use anyhow::{self, bail};
 use rand::Rng;
 use vortex::*;
 
@@ -30,6 +29,7 @@ enum BroadcastPayload {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
 enum BroadcastSignal {
     Gossip,
 }
@@ -45,13 +45,12 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
         network: &mut Network,
         sender: mpsc::Sender<Event<BroadcastPayload, BroadcastSignal>>,
     ) -> Self {
-        thread::spawn(move || loop {
-            // TODO: try smaller
-            thread::sleep(Duration::from_millis(150));
-            if let Err(_) = sender.send(Event::Signal(BroadcastSignal::Gossip)) {
-                return Ok::<_, anyhow::Error>(());
-            }
-        });
+        spawn_timer(
+            BroadcastSignal::Gossip,
+            sender.map_input(|signal| Event::Signal(signal)),
+            Duration::from_millis(150),
+            None,
+        );
 
         network.set_sqrt_topology();
         Self {
@@ -71,7 +70,9 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
         network: &mut Network,
     ) -> anyhow::Result<()> {
         match event {
-            Event::EOF => todo!(),
+            Event::RaftMessage(_) | Event::RaftSignal(_) | Event::EOF => {
+                bail!("Unexpected event recieved: {event:?}")
+            }
             Event::Signal(signal) => {
                 match signal {
                     BroadcastSignal::Gossip => {

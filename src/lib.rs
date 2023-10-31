@@ -1,17 +1,30 @@
+pub mod raft;
+
 pub use anyhow::Context;
-use serde::de::DeserializeOwned;
+pub use raft::*;
 pub use serde::{Deserialize, Serialize};
 pub use std::io::{StdoutLock, Write};
+
+use serde::de::DeserializeOwned;
 use std::{
-    sync::mpsc::{self, Sender},
-    thread,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, SendError, Sender},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use anyhow::bail;
 
-pub enum Event<Payload: Clone, Signal = ()> {
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+pub enum Event<Payload: Clone, Signal = (), LogEntry: Clone = ()> {
     Message(Message<Payload>),
+    RaftMessage(Message<RaftPayload<LogEntry>>),
     Signal(Signal),
+    RaftSignal(RaftSignal),
     EOF,
 }
 
@@ -180,14 +193,18 @@ where
         let sender_clone = sender.clone();
         let handle = thread::spawn(move || {
             let stdin = std::io::stdin().lock();
-            let input =
-                serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
+            let input = serde_json::Deserializer::from_reader(stdin).into_iter::<Event<Payload>>();
 
-            for msg in input {
-                let msg = msg.context("Deserialize messge")?;
+            for event in input {
+                let event = event.context("Deserialize event")?;
 
-                // If connection is closed, wrap things up
-                if let Err(_) = sender_clone.send(Event::Message(msg)) {
+                let event: Event<Payload, Signal> = match event {
+                    Event::Message(msg) => Event::Message(msg),
+                    Event::RaftMessage(msg) => Event::RaftMessage(msg),
+                    _ => bail!("Got local event over the network"),
+                };
+
+                if let Err(_) = sender_clone.send(event) {
                     return Ok::<_, anyhow::Error>(());
                 }
             }
@@ -208,5 +225,80 @@ where
             .context("Stdin reader thread err")?;
 
         Ok(())
+    }
+}
+
+pub fn spawn_timer<Sender, Signal>(
+    signal: Signal,
+    sender: Sender,
+    dur: Duration,
+    interrupt: Option<Arc<AtomicBool>>,
+) -> JoinHandle<anyhow::Result<()>>
+where
+    Signal: Send + 'static + Copy,
+    Sender: SenderExt<Signal>,
+{
+    // thread::spawn(move || {
+    //     let mut now = Instant::now();
+    //     loop {
+    //         if let Some(interrupt) = &interrupt {
+    //             if interrupt.load(Ordering::Relaxed) {
+    //                 now = Instant::now();
+    //                 interrupt.store(false, Ordering::Relaxed);
+    //             }
+    //         }
+
+    //         if now.elapsed() > dur {
+    //             if let Err(_) = sender.send(signal) {
+    //                 return Ok::<_, anyhow::Error>(());
+    //             }
+    //         }
+    //     }
+    // })
+
+    thread::spawn(move || loop {
+        thread::sleep(dur);
+        if let Err(_) = sender.send(signal) {
+            return Ok::<_, anyhow::Error>(());
+        }
+    })
+}
+
+pub trait SenderExt<T>: Clone + Send + 'static {
+    type Err;
+
+    fn send(&self, t: T) -> Result<(), SendError<Self::Err>>;
+
+    fn map_input<U, F>(self, func: F) -> MapSender<Self, F>
+    where
+        Self: Sized,
+        F: Fn(U) -> T,
+    {
+        MapSender { sender: self, func }
+    }
+}
+
+impl<T: Send + 'static> SenderExt<T> for Sender<T> {
+    type Err = T;
+
+    fn send(&self, t: T) -> Result<(), SendError<Self::Err>> {
+        self.send(t)
+    }
+}
+
+#[derive(Clone)]
+pub struct MapSender<S, F> {
+    sender: S,
+    func: F,
+}
+
+impl<S: SenderExt<U>, F, T, U> SenderExt<T> for MapSender<S, F>
+where
+    F: Fn(T) -> U + Clone + Send + 'static,
+{
+    type Err = S::Err;
+
+    fn send(&self, value: T) -> Result<(), SendError<Self::Err>> {
+        self.sender.send((self.func)(value))
     }
 }
