@@ -238,30 +238,31 @@ where
     Signal: Send + 'static + Copy,
     Sender: SenderExt<Signal>,
 {
-    // thread::spawn(move || {
-    //     let mut now = Instant::now();
-    //     loop {
-    //         if let Some(interrupt) = &interrupt {
-    //             if interrupt.load(Ordering::Relaxed) {
-    //                 now = Instant::now();
-    //                 interrupt.store(false, Ordering::Relaxed);
-    //             }
-    //         }
+    thread::spawn(move || {
+        let mut now = Instant::now();
+        loop {
+            if let Some(interrupt) = &interrupt {
+                if interrupt.load(Ordering::Relaxed) {
+                    now = Instant::now();
+                    interrupt.store(false, Ordering::Relaxed);
+                }
+            }
 
-    //         if now.elapsed() > dur {
-    //             if let Err(_) = sender.send(signal) {
-    //                 return Ok::<_, anyhow::Error>(());
-    //             }
-    //         }
-    //     }
-    // })
-
-    thread::spawn(move || loop {
-        thread::sleep(dur);
-        if let Err(_) = sender.send(signal) {
-            return Ok::<_, anyhow::Error>(());
+            if now.elapsed() > dur {
+                if let Err(_) = sender.send(signal) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                now = Instant::now();
+            }
         }
     })
+
+    // thread::spawn(move || loop {
+    //     thread::sleep(dur);
+    //     if let Err(_) = sender.send(signal) {
+    //         return Ok::<_, anyhow::Error>(());
+    //     }
+    // })
 }
 
 pub trait SenderExt<T>: Clone + Send + 'static {
