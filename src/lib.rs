@@ -256,13 +256,6 @@ where
             }
         }
     })
-
-    // thread::spawn(move || loop {
-    //     thread::sleep(dur);
-    //     if let Err(_) = sender.send(signal) {
-    //         return Ok::<_, anyhow::Error>(());
-    //     }
-    // })
 }
 
 pub trait SenderExt<T>: Clone + Send + 'static {
