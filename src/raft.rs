@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use rand::Rng;
 
@@ -7,14 +11,14 @@ use crate::*;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-pub enum RaftPayload<Entry> {
+pub enum RaftPayload<Entry = ()> {
     RequestVote {
         /// candidate’s term
         term: u64,
         /// index of candidate’s last log entry
         last_log_index: usize,
         /// term of candidate’s last log entry
-        last_log_term: usize,
+        last_log_term: u64,
     },
     RequestVoteOk {
         /// currentTerm, for candidate to update itself
@@ -28,28 +32,24 @@ pub enum RaftPayload<Entry> {
         term: u64,
         /// index of log entry immediately preceding new ones
         prev_log_index: usize,
-        /// term of prevLogIndex entry
-        prev_log_term: usize,
-        entries: Vec<(usize, Entry)>,
+        /// term of prev_log_index entry
+        prev_log_term: u64,
+        entries: Vec<(Entry, u64)>,
     },
-    /// Leader tells followers to commit up to and including `index`
-    Commit { index: usize },
-    /// Follower tells leader
-    CommitOk { index: usize },
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum RaftSignal {
     Heartbeat,
-    BecomeCandidate,
+    Campaign,
 }
 
 pub struct RaftService<Entry> {
     msg_id: IdCounter,
     /// latest term server has seen
-    current_term: u64,
+    current_term: Arc<Mutex<u64>>,
     /// log entries; each entry contains command for state machine, and term when entry was received by leader
-    log: Vec<(Entry, u64)>,
+    log: Vec<Option<(Entry, u64)>>,
     /// index of highest log entry known to be committed
     commit_index: usize,
     /// index of highest log entry applied to state machine
@@ -61,47 +61,88 @@ pub struct RaftService<Entry> {
     /// for each server, index of highest log entry known to be replicated on server
     match_index: HashMap<String, usize>,
     /// Votes recieved from servers
-    votes: Vec<String>,
+    votes: HashSet<String>,
+    /// True iff self is leader
+    is_leader: bool,
     /// Whether or not to reset the election timeout
     /// (set to true only when leader sends an AppendEntries)
-    reset_election_timeout: Arc<AtomicBool>,
+    reset_election_timer: Arc<AtomicBool>,
 }
 
-impl<Entry> RaftService<Entry> {
+impl<Entry: Clone + Serialize> RaftService<Entry> {
     pub fn create(network: &mut Network, sender: impl SenderExt<RaftSignal>) -> Self {
+        let current_term = Arc::new(Mutex::new(0));
+
         let mut rng = rand::thread_rng();
 
         // Between 150 and 300 as per Raft spec
         let election_timeout = Duration::from_millis(rng.gen_range(150..=300));
         let heartbeat_timeout = Duration::from_millis(150);
 
-        let reset_election_timeout = Arc::new(AtomicBool::new(false));
+        let reset_election_timer = Arc::new(AtomicBool::new(false));
+        let ct = current_term.clone();
+        let sender_clone = sender.clone();
         spawn_timer(
-            RaftSignal::BecomeCandidate,
-            sender.clone(),
+            Box::new(move || {
+                *ct.lock().expect("Couldn't lock mutex") += 1;
+                let _ = sender_clone.send(RaftSignal::Campaign);
+                Ok(())
+            }),
             election_timeout,
-            Some(reset_election_timeout.clone()),
+            Some(reset_election_timer.clone()),
         );
 
-        spawn_timer(RaftSignal::Heartbeat, sender, heartbeat_timeout, None);
+        spawn_timer(
+            Box::new(move || {
+                let _ = sender.send(RaftSignal::Heartbeat);
+                Ok(())
+            }),
+            heartbeat_timeout,
+            None,
+        );
 
         Self {
             msg_id: IdCounter::new(),
-            log: Vec::new(),
+            log: vec![None],
             commit_index: 0,
             last_applied: 0,
-            current_term: 0,
+            current_term,
             voted_for: None,
             next_index: network.all_nodes.iter().cloned().map(|n| (n, 1)).collect(),
             match_index: network.all_nodes.iter().cloned().map(|n| (n, 0)).collect(),
-            votes: Vec::new(),
-            reset_election_timeout,
+            votes: HashSet::new(),
+            is_leader: false,
+            reset_election_timer,
         }
     }
 
-    fn is_leader(&self) -> bool {
-        // self.votes.len() > (self.n_peers / 2)
-        todo!()
+    fn last_log_index(&self) -> usize {
+        self.log.len() - 1
+    }
+
+    fn term(&self) -> u64 {
+        *self
+            .current_term
+            .lock()
+            .expect("Failed to acquire mutex lock")
+    }
+
+    fn set_term(&mut self, new_term: u64) {
+        *self
+            .current_term
+            .lock()
+            .expect("Failed to acquire mutex lock") = new_term
+    }
+
+    fn last_log_term(&self) -> u64 {
+        self.log[self.last_log_index()]
+            .as_ref()
+            .map(|(_, term)| *term)
+            .unwrap_or(0)
+    }
+
+    fn delay_election(&self) {
+        self.reset_election_timer.store(true, Ordering::Relaxed);
     }
 
     /// Request to append entry to the log
@@ -115,26 +156,135 @@ impl<Entry> RaftService<Entry> {
             Event::RaftSignal(signal) => match signal {
                 RaftSignal::Heartbeat => {
                     // If leader, send append entries
+                    if !self.is_leader {
+                        return Ok(());
+                    }
+
+                    self.delay_election();
+
+                    eprintln!("{} sending heartbeats", network.node_id);
+                    for (follower, &next_index) in self.next_index.iter() {
+                        if follower == &network.node_id {
+                            continue;
+                        }
+
+                        let entries = self.log[next_index..]
+                            .iter()
+                            .map(|e| e.clone().expect("Only the 0th element should be None"))
+                            .collect();
+
+                        network
+                            .send(
+                                follower.to_string(),
+                                Body {
+                                    msg_id: self.msg_id.next(),
+                                    in_reply_to: None,
+                                    payload: RaftPayload::AppendEntries {
+                                        term: self.term(),
+                                        prev_log_index: next_index - 1,
+                                        prev_log_term: self.log[next_index - 1]
+                                            .as_ref()
+                                            .map(|(_, term)| *term)
+                                            .unwrap_or(0),
+                                        entries,
+                                    },
+                                },
+                            )
+                            .context("Send append entries")?;
+                    }
                 }
-                RaftSignal::BecomeCandidate => {
-                    // Broadcast RequestVote
+                RaftSignal::Campaign => {
+                    eprintln!("{} campaigning", network.node_id);
+                    // Broadcast RequestVote, vote for self
+
+                    self.voted_for = Some(network.node_id.clone());
+                    self.votes.insert(network.node_id.clone());
+
+                    self.delay_election();
+
+                    for other in network.all_nodes.clone() {
+                        if other == network.node_id {
+                            continue;
+                        }
+
+                        network
+                            .send(
+                                other,
+                                Body {
+                                    msg_id: self.msg_id.next(),
+                                    in_reply_to: None,
+                                    payload: RaftPayload::<Entry>::RequestVote {
+                                        term: self.term(),
+                                        last_log_index: self.last_log_index(),
+                                        last_log_term: self.last_log_term(),
+                                    },
+                                },
+                            )
+                            .context("Send request vote")?;
+                    }
                 }
             },
             Event::RaftMessage(msg) => match msg.body.payload {
+                RaftPayload::RequestVote {
+                    term,
+                    last_log_index,
+                    last_log_term,
+                } => {
+                    //  Grant vote iff term >= currentTerm,
+                    //  votedFor is null or candidateId, and
+                    //  candidate’s log is at least as up-to-date as
+                    //  receiver’s log
+
+                    let granted = term >= self.term()
+                        && !self.voted_for.as_ref().is_some_and(|v| v != &msg.src)
+                        && (last_log_term, last_log_index)
+                            >= (self.last_log_term(), self.last_log_index());
+
+                    if granted {
+                        self.voted_for = Some(msg.src.clone());
+                        self.set_term(term);
+                        eprintln!("{} voted for {} in term {term}", network.node_id, msg.src);
+                        self.delay_election()
+                    }
+
+                    network
+                        .reply(
+                            msg.src,
+                            self.msg_id.next(),
+                            msg.body.msg_id,
+                            RaftPayload::<Entry>::RequestVoteOk {
+                                term: self.term(),
+                                vote_granted: granted,
+                            },
+                        )
+                        .context("Request vote OK reply")?;
+                }
+                RaftPayload::RequestVoteOk { term, vote_granted } => {
+                    if vote_granted && term == self.term() {
+                        self.votes.insert(msg.src);
+                    }
+
+                    if self.votes.len() > network.all_nodes.len() / 2 {
+                        eprintln!(
+                            "{} has been elected as leader in term {term}",
+                            network.node_id
+                        );
+                        self.is_leader = true;
+                    }
+                }
                 RaftPayload::AppendEntries {
                     term,
                     prev_log_index,
                     prev_log_term,
                     entries,
-                } => {}
-                RaftPayload::RequestVote {
-                    term,
-                    last_log_index,
-                    last_log_term,
-                } => todo!(),
-                RaftPayload::RequestVoteOk { term, vote_granted } => todo!(),
-                RaftPayload::Commit { index } => todo!(),
-                RaftPayload::CommitOk { index } => todo!(),
+                } => {
+                    if !self.voted_for.as_ref().is_some_and(|v| v == &msg.src) {
+                        return Ok(());
+                    }
+
+                    self.delay_election();
+                    eprintln!("got heartbeat from {}", msg.src);
+                }
             },
 
             Event::Message(_) | Event::Signal(_) => bail!("Unexpected event recieved: {event:?}"),

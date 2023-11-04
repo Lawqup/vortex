@@ -38,8 +38,10 @@ impl Service<CounterPayload, BroadcastSignal> for CounterService {
         sender: mpsc::Sender<Event<CounterPayload, BroadcastSignal>>,
     ) -> Self {
         spawn_timer(
-            BroadcastSignal::Gossip,
-            sender.map_input(|s| Event::Signal(s)),
+            Box::new(move || {
+                let _ = sender.send(Event::Signal(BroadcastSignal::Gossip));
+                Ok(())
+            }),
             Duration::from_millis(150),
             None,
         );

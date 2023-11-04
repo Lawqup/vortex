@@ -228,15 +228,13 @@ where
     }
 }
 
-pub fn spawn_timer<Sender, Signal>(
-    signal: Signal,
-    sender: Sender,
+pub fn spawn_timer<F>(
+    cb: Box<F>,
     dur: Duration,
     interrupt: Option<Arc<AtomicBool>>,
 ) -> JoinHandle<anyhow::Result<()>>
 where
-    Signal: Send + 'static + Copy,
-    Sender: SenderExt<Signal>,
+    F: Fn() -> anyhow::Result<()> + Send + 'static,
 {
     thread::spawn(move || {
         let mut now = Instant::now();
@@ -249,16 +247,17 @@ where
             }
 
             if now.elapsed() > dur {
-                if let Err(_) = sender.send(signal) {
-                    return Ok::<_, anyhow::Error>(());
-                }
+                // if let Err(_) = sender.send(signal) {
+                //     return Ok::<_, anyhow::Error>(());
+                // }
+                cb()?;
                 now = Instant::now();
             }
         }
     })
 }
 
-pub trait SenderExt<T>: Clone + Send + 'static {
+pub trait SenderExt<T>: Clone + Send + Sync + 'static {
     type Err;
 
     fn send(&self, t: T) -> Result<(), SendError<Self::Err>>;
@@ -288,7 +287,7 @@ pub struct MapSender<S, F> {
 
 impl<S: SenderExt<U>, F, T, U> SenderExt<T> for MapSender<S, F>
 where
-    F: Fn(T) -> U + Clone + Send + 'static,
+    F: Fn(T) -> U + Clone + Send + Sync + 'static,
 {
     type Err = S::Err;
 

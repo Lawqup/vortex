@@ -46,8 +46,10 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
         sender: mpsc::Sender<Event<BroadcastPayload, BroadcastSignal>>,
     ) -> Self {
         spawn_timer(
-            BroadcastSignal::Gossip,
-            sender.map_input(|signal| Event::Signal(signal)),
+            Box::new(move || {
+                let _ = sender.send(Event::Signal(BroadcastSignal::Gossip));
+                Ok(())
+            }),
             Duration::from_millis(150),
             None,
         );
