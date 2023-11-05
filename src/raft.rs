@@ -47,7 +47,7 @@ pub enum RaftSignal {
 pub struct RaftService<Entry> {
     msg_id: IdCounter,
     /// latest term server has seen
-    current_term: Arc<Mutex<u64>>,
+    current_term: u64,
     /// log entries; each entry contains command for state machine, and term when entry was received by leader
     log: Vec<Option<(Entry, u64)>>,
     /// index of highest log entry known to be committed
@@ -71,20 +71,14 @@ pub struct RaftService<Entry> {
 
 impl<Entry: Clone + Serialize> RaftService<Entry> {
     pub fn create(network: &mut Network, sender: impl SenderExt<RaftSignal>) -> Self {
-        let current_term = Arc::new(Mutex::new(0));
-
-        let mut rng = rand::thread_rng();
-
         // Between 150 and 300 as per Raft spec
-        let election_timeout = Duration::from_millis(rng.gen_range(150..=300));
+        let election_timeout = Duration::from_millis(rand::thread_rng().gen_range(150..=300));
         let heartbeat_timeout = Duration::from_millis(150);
 
         let reset_election_timer = Arc::new(AtomicBool::new(false));
-        let ct = current_term.clone();
         let sender_clone = sender.clone();
         spawn_timer(
             Box::new(move || {
-                *ct.lock().expect("Couldn't lock mutex") += 1;
                 let _ = sender_clone.send(RaftSignal::Campaign);
                 Ok(())
             }),
@@ -106,7 +100,7 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
             log: vec![None],
             commit_index: 0,
             last_applied: 0,
-            current_term,
+            current_term: 0,
             voted_for: None,
             next_index: network.all_nodes.iter().cloned().map(|n| (n, 1)).collect(),
             match_index: network.all_nodes.iter().cloned().map(|n| (n, 0)).collect(),
@@ -120,20 +114,6 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
         self.log.len() - 1
     }
 
-    fn term(&self) -> u64 {
-        *self
-            .current_term
-            .lock()
-            .expect("Failed to acquire mutex lock")
-    }
-
-    fn set_term(&mut self, new_term: u64) {
-        *self
-            .current_term
-            .lock()
-            .expect("Failed to acquire mutex lock") = new_term
-    }
-
     fn last_log_term(&self) -> u64 {
         self.log[self.last_log_index()]
             .as_ref()
@@ -143,6 +123,14 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
 
     fn delay_election(&self) {
         self.reset_election_timer.store(true, Ordering::Relaxed);
+    }
+
+    fn update_term(&mut self, term: u64) {
+        self.current_term = term;
+        self.is_leader = false;
+        self.votes.clear();
+        // Voted for no one in this new term
+        self.voted_for = None;
     }
 
     /// Request to append entry to the log
@@ -159,8 +147,6 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                     if !self.is_leader {
                         return Ok(());
                     }
-
-                    self.delay_election();
 
                     eprintln!("{} sending heartbeats", network.node_id);
                     for (follower, &next_index) in self.next_index.iter() {
@@ -180,7 +166,7 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                                     msg_id: self.msg_id.next(),
                                     in_reply_to: None,
                                     payload: RaftPayload::AppendEntries {
-                                        term: self.term(),
+                                        term: self.current_term,
                                         prev_log_index: next_index - 1,
                                         prev_log_term: self.log[next_index - 1]
                                             .as_ref()
@@ -194,12 +180,20 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                     }
                 }
                 RaftSignal::Campaign => {
-                    eprintln!("{} campaigning", network.node_id);
-                    // Broadcast RequestVote, vote for self
+                    if self.is_leader {
+                        return Ok(());
+                    }
 
+                    self.update_term(self.current_term + 1);
+
+                    eprintln!(
+                        "{} campaigning in new term {}",
+                        network.node_id, self.current_term
+                    );
+
+                    // Broadcast RequestVote, vote for self
                     self.voted_for = Some(network.node_id.clone());
                     self.votes.insert(network.node_id.clone());
-
                     self.delay_election();
 
                     for other in network.all_nodes.clone() {
@@ -214,7 +208,7 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                                     msg_id: self.msg_id.next(),
                                     in_reply_to: None,
                                     payload: RaftPayload::<Entry>::RequestVote {
-                                        term: self.term(),
+                                        term: self.current_term,
                                         last_log_index: self.last_log_index(),
                                         last_log_term: self.last_log_term(),
                                     },
@@ -234,17 +228,22 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                     //  votedFor is null or candidateId, and
                     //  candidate’s log is at least as up-to-date as
                     //  receiver’s log
+                    if term > self.current_term {
+                        self.update_term(term);
+                    }
 
-                    let granted = term >= self.term()
+                    let granted = term >= self.current_term
                         && !self.voted_for.as_ref().is_some_and(|v| v != &msg.src)
                         && (last_log_term, last_log_index)
                             >= (self.last_log_term(), self.last_log_index());
 
                     if granted {
+                        self.update_term(term);
+
                         self.voted_for = Some(msg.src.clone());
-                        self.set_term(term);
+                        self.delay_election();
+
                         eprintln!("{} voted for {} in term {term}", network.node_id, msg.src);
-                        self.delay_election()
                     }
 
                     network
@@ -253,22 +252,32 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                             self.msg_id.next(),
                             msg.body.msg_id,
                             RaftPayload::<Entry>::RequestVoteOk {
-                                term: self.term(),
+                                term: self.current_term,
                                 vote_granted: granted,
                             },
                         )
                         .context("Request vote OK reply")?;
                 }
                 RaftPayload::RequestVoteOk { term, vote_granted } => {
-                    if vote_granted && term == self.term() {
+                    if term > self.current_term {
+                        self.update_term(term);
+                        return Ok(());
+                    }
+
+                    if vote_granted && term == self.current_term {
                         self.votes.insert(msg.src);
                     }
 
-                    if self.votes.len() > network.all_nodes.len() / 2 {
+                    if self.votes.len() > network.all_nodes.len() / 2 && !self.is_leader {
                         eprintln!(
                             "{} has been elected as leader in term {term}",
                             network.node_id
                         );
+
+                        // Send inital heartbeat as soon as elected
+                        self.step(Event::RaftSignal(RaftSignal::Heartbeat), network)
+                            .context("Heartbeat on elected")?;
+
                         self.is_leader = true;
                     }
                 }
@@ -278,7 +287,15 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                     prev_log_term,
                     entries,
                 } => {
-                    if !self.voted_for.as_ref().is_some_and(|v| v == &msg.src) {
+                    if term >= self.current_term {
+                        // Must be from a new leader
+                        self.update_term(term);
+                        self.voted_for = Some(msg.src.clone());
+                    }
+
+                    if term < self.current_term
+                        || !self.voted_for.as_ref().is_some_and(|v| v == &msg.src)
+                    {
                         return Ok(());
                     }
 
