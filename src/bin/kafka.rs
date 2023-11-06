@@ -32,47 +32,66 @@ enum LogPayload {
     },
 }
 
+type RaftEntry = (String, Option<u64>, String, u64);
+
+type E = Event<LogPayload, (), RaftEntry>;
+
 struct LogService {
     msg_id: IdCounter,
-    raft: RaftService<()>,
+    raft: RaftService<RaftEntry>,
     logs: HashMap<String, Log>,
 }
 
-impl Service<LogPayload> for LogService {
-    fn create(network: &mut Network, sender: mpsc::Sender<Event<LogPayload>>) -> Self {
-        let raft = RaftService::create(network, sender.map_input(|s| Event::RaftSignal(s)));
+impl Service<LogPayload, (), RaftEntry> for LogService {
+    fn create(network: &mut Network, sender: mpsc::Sender<E>) -> Self {
+        let raft = RaftService::create(sender.map_input(E::Raft));
 
-        network.set_sqrt_topology();
+        network.set_mesh_topology();
         Self {
             msg_id: IdCounter::new(),
             logs: HashMap::new(),
             raft,
         }
     }
-    fn step(&mut self, event: Event<LogPayload>, network: &mut Network) -> anyhow::Result<()> {
+    fn step(&mut self, event: E, network: &mut Network) -> anyhow::Result<()> {
         match event {
             Event::Signal(_) => todo!(),
             Event::EOF => todo!(),
-            Event::RaftMessage(message) => {
-                self.raft.step(Event::RaftMessage(message), network)?;
-            }
-            Event::RaftSignal(signal) => {
-                self.raft.step(Event::RaftSignal(signal), network)?;
+            Event::Raft(e) => {
+                match e {
+                    RaftEvent::RaftMessage(message) => {
+                        self.raft.step(RaftEvent::RaftMessage(message), network)?;
+                    }
+                    RaftEvent::RaftSignal(signal) => {
+                        self.raft.step(RaftEvent::RaftSignal(signal), network)?;
+                    }
+                    RaftEvent::CommitedEntry((client, in_response_to, key, msg)) => {
+                        // Finally reply to client
+
+                        let log = self.logs.entry(key).or_insert(Log::new());
+
+                        network
+                            .reply(
+                                client,
+                                self.msg_id.next(),
+                                in_response_to,
+                                LogPayload::SendOk {
+                                    offset: log.push(msg),
+                                },
+                            )
+                            .context("Send reply")?;
+                    }
+                }
             }
             Event::Message(message) => match message.body.payload {
                 LogPayload::Send { key, msg } => {
-                    let log = self.logs.entry(key).or_insert(Log::new());
-
-                    network
-                        .reply(
-                            message.src,
-                            self.msg_id.next(),
-                            message.body.msg_id,
-                            LogPayload::SendOk {
-                                offset: log.push(msg),
-                            },
+                    eprintln!("Requesting {key} {msg}");
+                    self.raft
+                        .request(
+                            (message.src, message.body.msg_id, key.clone(), msg),
+                            &network.node_id,
                         )
-                        .context("Send reply")?;
+                        .context("Requesting raft")?;
                 }
                 LogPayload::Poll { offsets } => {
                     let mut msgs = HashMap::new();

@@ -52,7 +52,15 @@ pub enum RaftSignal {
     Campaign,
 }
 
-pub struct RaftService<Entry> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RaftEvent<Entry: Clone> {
+    RaftMessage(Message<RaftPayload<Entry>>),
+    RaftSignal(RaftSignal),
+    CommitedEntry(Entry),
+}
+
+pub struct RaftService<Entry: Clone> {
     msg_id: IdCounter,
     /// latest term server has seen
     current_term: u64,
@@ -71,10 +79,12 @@ pub struct RaftService<Entry> {
     /// Whether or not to reset the election timeout
     /// (set to true only when leader sends an AppendEntries)
     reset_election_timer: Arc<AtomicBool>,
+    /// Sends commited log entries to the client node
+    log_sender: Box<dyn SenderExt<Entry>>,
 }
 
-impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
-    pub fn create(_network: &mut Network, sender: impl SenderExt<RaftSignal>) -> Self {
+impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
+    pub fn create(sender: impl SenderExt<RaftEvent<Entry>> + Clone) -> Self {
         // Between 150 and 300 as per Raft spec
         let election_timeout = Duration::from_millis(rand::thread_rng().gen_range(150..=300));
         let heartbeat_timeout = Duration::from_millis(150);
@@ -83,16 +93,17 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
         let sender_clone = sender.clone();
         spawn_timer(
             Box::new(move || {
-                let _ = sender_clone.send(RaftSignal::Campaign);
+                let _ = sender_clone.send(RaftEvent::RaftSignal(RaftSignal::Campaign));
                 Ok(())
             }),
             election_timeout,
             Some(reset_election_timer.clone()),
         );
 
+        let sender_clone = sender.clone();
         spawn_timer(
             Box::new(move || {
-                let _ = sender.send(RaftSignal::Heartbeat);
+                let _ = sender_clone.send(RaftEvent::RaftSignal(RaftSignal::Heartbeat));
                 Ok(())
             }),
             heartbeat_timeout,
@@ -109,6 +120,7 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
             match_index: HashMap::new(),
             votes: HashSet::new(),
             reset_election_timer,
+            log_sender: Box::new(sender.map_input(RaftEvent::CommitedEntry)),
         }
     }
 
@@ -180,14 +192,21 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
         Ok(())
     }
 
-    pub fn step(
-        &mut self,
-        event: Event<(), (), Entry>,
-        network: &mut Network,
-    ) -> anyhow::Result<()> {
+    fn commit(&mut self, new_idx: usize) {
+        let prev = self.commit_index;
+        self.commit_index = new_idx;
+        for i in prev + 1..=self.commit_index {
+            if let Some((e, _)) = self.log[i].clone() {
+                let _ = self.log_sender.send(e);
+            }
+        }
+
+        eprintln!("Commited entries {}-{}", prev + 1, self.commit_index);
+    }
+
+    pub fn step(&mut self, event: RaftEvent<Entry>, network: &mut Network) -> anyhow::Result<()> {
         match event {
-            Event::EOF => todo!(),
-            Event::RaftSignal(signal) => match signal {
+            RaftEvent::RaftSignal(signal) => match signal {
                 RaftSignal::Heartbeat => {
                     // If leader, send append entries
                     if !self.is_leader() {
@@ -196,6 +215,7 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
 
                     eprintln!("{} sending heartbeats", network.node_id);
                     for follower in network.all_nodes.clone() {
+                        // TODO: singelton case
                         if follower == network.node_id {
                             continue;
                         }
@@ -221,6 +241,21 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
                     self.votes.insert(network.node_id.clone());
                     self.delay_election();
 
+                    // TODO: singelton case
+                    // if network.all_nodes.len() == 1 {
+                    //     self.next_index = network
+                    //         .all_nodes
+                    //         .iter()
+                    //         .cloned()
+                    //         .map(|n| (n, self.last_log_index() + 1))
+                    //         .collect();
+
+                    //     self.match_index =
+                    //         network.all_nodes.iter().cloned().map(|n| (n, 0)).collect();
+
+                    //     return Ok(());
+                    // }
+
                     for other in network.all_nodes.clone() {
                         if other == network.node_id {
                             continue;
@@ -243,12 +278,13 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
                     }
                 }
             },
-            Event::RaftMessage(msg) => match msg.body.payload {
+            RaftEvent::RaftMessage(msg) => match msg.body.payload {
                 RaftPayload::RequestVote {
                     term,
                     last_log_index,
                     last_log_term,
                 } => {
+                    eprintln!("Got vote request from {} at term {}", msg.src, term);
                     //  Grant vote iff term >= currentTerm,
                     //  votedFor is null or candidateId, and
                     //  candidate’s log is at least as up-to-date as
@@ -313,7 +349,7 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
                             network.all_nodes.iter().cloned().map(|n| (n, 0)).collect();
 
                         // Send inital heartbeat as soon as elected
-                        self.step(Event::RaftSignal(RaftSignal::Heartbeat), network)
+                        self.step(RaftEvent::RaftSignal(RaftSignal::Heartbeat), network)
                             .context("Heartbeat on elected")?;
                     }
                 }
@@ -366,10 +402,12 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
 
                     self.log.extend(entries.into_iter().map(Some));
 
-                    self.commit_index = std::cmp::max(
+                    let new_idx = std::cmp::max(
                         self.commit_index,
                         std::cmp::min(leader_commit, self.last_log_index()),
                     );
+
+                    self.commit(new_idx);
 
                     network
                         .reply(
@@ -419,22 +457,22 @@ impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
                         }
 
                         let half_nodes = network.all_nodes.len() / 2;
-                        self.commit_index = counts
+
+                        let new_idx = counts
                             .into_iter()
                             .filter(|(_, c)| c > &half_nodes)
                             .map(|(v, _)| v)
                             .max()
                             .unwrap_or(0);
 
-                        eprintln!("Commited up to {}", self.commit_index);
+                        self.commit(new_idx);
                     } else {
                         self.send_append_entries(msg.src, network)
                             .context("Append entries retry")?;
                     }
                 }
             },
-
-            Event::Message(_) | Event::Signal(_) => bail!("Unexpected event recieved: {event:?}"),
+            RaftEvent::CommitedEntry(_) => bail!("Commited entry should be handled by Raft client"),
         }
         Ok(())
     }

@@ -72,7 +72,7 @@ impl Service<BroadcastPayload, BroadcastSignal> for BroadcastService {
         network: &mut Network,
     ) -> anyhow::Result<()> {
         match event {
-            Event::RaftMessage(_) | Event::RaftSignal(_) | Event::EOF => {
+            Event::Raft(_) | Event::EOF => {
                 bail!("Unexpected event recieved: {event:?}")
             }
             Event::Signal(signal) => {

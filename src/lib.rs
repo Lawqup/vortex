@@ -7,24 +7,24 @@ pub use std::io::{StdoutLock, Write};
 
 use serde::de::DeserializeOwned;
 use std::{
+    fmt::Debug,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, SendError, Sender},
+        mpsc::{self, Sender},
         Arc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum Event<Payload: Clone, Signal = (), LogEntry: Clone = ()> {
     Message(Message<Payload>),
-    RaftMessage(Message<RaftPayload<LogEntry>>),
     Signal(Signal),
-    RaftSignal(RaftSignal),
+    Raft(RaftEvent<LogEntry>),
     EOF,
 }
 
@@ -94,6 +94,7 @@ impl Network {
             dest,
             body,
         };
+
         serde_json::to_writer(&mut self.output, &reply).context("Serialize message")?;
         self.output.write_all(b"\n")?;
         Ok(())
@@ -156,14 +157,19 @@ impl Default for IdCounter {
     }
 }
 
-pub trait Service<Payload, Signal = ()>: Sized
+pub trait Service<Payload, Signal = (), RaftEntry = ()>: Sized
 where
-    Payload: DeserializeOwned + Send + Clone + 'static,
+    Payload: DeserializeOwned + Send + Clone + 'static + Debug,
     Signal: Send + 'static,
+    RaftEntry: Clone + DeserializeOwned + Send + 'static + Debug,
 {
-    fn create(network: &mut Network, sender: Sender<Event<Payload, Signal>>) -> Self;
+    fn create(network: &mut Network, sender: Sender<Event<Payload, Signal, RaftEntry>>) -> Self;
 
-    fn step(&mut self, input: Event<Payload, Signal>, network: &mut Network) -> anyhow::Result<()>;
+    fn step(
+        &mut self,
+        input: Event<Payload, Signal, RaftEntry>,
+        network: &mut Network,
+    ) -> anyhow::Result<()>;
 
     fn run() -> anyhow::Result<()> {
         let mut stdin = std::io::stdin().lock();
@@ -199,14 +205,15 @@ where
         let sender_clone = sender.clone();
         let handle = thread::spawn(move || {
             let stdin = std::io::stdin().lock();
-            let input = serde_json::Deserializer::from_reader(stdin).into_iter::<Event<Payload>>();
+            let input = serde_json::Deserializer::from_reader(stdin)
+                .into_iter::<Event<Payload, (), RaftEntry>>();
 
             for event in input {
                 let event = event.context("Deserialize event")?;
 
-                let event: Event<Payload, Signal> = match event {
+                let event: Event<Payload, Signal, RaftEntry> = match event {
                     Event::Message(msg) => Event::Message(msg),
-                    Event::RaftMessage(msg) => Event::RaftMessage(msg),
+                    Event::Raft(msg) => Event::Raft(msg),
                     _ => bail!("Got local event over the network"),
                 };
 
@@ -253,9 +260,6 @@ where
             }
 
             if now.elapsed() > dur {
-                // if let Err(_) = sender.send(signal) {
-                //     return Ok::<_, anyhow::Error>(());
-                // }
                 cb()?;
                 now = Instant::now();
             }
@@ -263,10 +267,8 @@ where
     })
 }
 
-pub trait SenderExt<T>: Clone + Send + Sync + 'static {
-    type Err;
-
-    fn send(&self, t: T) -> Result<(), SendError<Self::Err>>;
+pub trait SenderExt<T>: Send + Sync + 'static {
+    fn send(&self, t: T) -> anyhow::Result<()>;
 
     fn map_input<U, F>(self, func: F) -> MapSender<Self, F>
     where
@@ -278,10 +280,8 @@ pub trait SenderExt<T>: Clone + Send + Sync + 'static {
 }
 
 impl<T: Send + 'static> SenderExt<T> for Sender<T> {
-    type Err = T;
-
-    fn send(&self, t: T) -> Result<(), SendError<Self::Err>> {
-        self.send(t)
+    fn send(&self, t: T) -> anyhow::Result<()> {
+        self.send(t).map_err(|_| anyhow!("Send error"))
     }
 }
 
@@ -295,9 +295,7 @@ impl<S: SenderExt<U>, F, T, U> SenderExt<T> for MapSender<S, F>
 where
     F: Fn(T) -> U + Clone + Send + Sync + 'static,
 {
-    type Err = S::Err;
-
-    fn send(&self, value: T) -> Result<(), SendError<Self::Err>> {
+    fn send(&self, value: T) -> anyhow::Result<()> {
         self.sender.send((self.func)(value))
     }
 }
