@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    fmt,
+    sync::Arc,
     time::Duration,
 };
 
@@ -35,6 +36,13 @@ pub enum RaftPayload<Entry = ()> {
         /// term of prev_log_index entry
         prev_log_term: u64,
         entries: Vec<(Entry, u64)>,
+        leader_commit: usize,
+    },
+    AppendEntriesOk {
+        term: u64,
+        success: bool,
+        /// Last index that was applied in the AppendEntries
+        applied_up_to: usize,
     },
 }
 
@@ -52,8 +60,6 @@ pub struct RaftService<Entry> {
     log: Vec<Option<(Entry, u64)>>,
     /// index of highest log entry known to be committed
     commit_index: usize,
-    /// index of highest log entry applied to state machine
-    last_applied: usize,
     /// Node that received our vote in current term
     voted_for: Option<String>,
     /// for each server, index of the next log entry to send to that server
@@ -62,15 +68,13 @@ pub struct RaftService<Entry> {
     match_index: HashMap<String, usize>,
     /// Votes recieved from servers
     votes: HashSet<String>,
-    /// True iff self is leader
-    is_leader: bool,
     /// Whether or not to reset the election timeout
     /// (set to true only when leader sends an AppendEntries)
     reset_election_timer: Arc<AtomicBool>,
 }
 
-impl<Entry: Clone + Serialize> RaftService<Entry> {
-    pub fn create(network: &mut Network, sender: impl SenderExt<RaftSignal>) -> Self {
+impl<Entry: Clone + Serialize + fmt::Debug> RaftService<Entry> {
+    pub fn create(_network: &mut Network, sender: impl SenderExt<RaftSignal>) -> Self {
         // Between 150 and 300 as per Raft spec
         let election_timeout = Duration::from_millis(rand::thread_rng().gen_range(150..=300));
         let heartbeat_timeout = Duration::from_millis(150);
@@ -99,26 +103,25 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
             msg_id: IdCounter::new(),
             log: vec![None],
             commit_index: 0,
-            last_applied: 0,
             current_term: 0,
             voted_for: None,
-            next_index: network.all_nodes.iter().cloned().map(|n| (n, 1)).collect(),
-            match_index: network.all_nodes.iter().cloned().map(|n| (n, 0)).collect(),
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
             votes: HashSet::new(),
-            is_leader: false,
             reset_election_timer,
         }
+    }
+
+    fn is_leader(&self) -> bool {
+        !self.next_index.is_empty()
     }
 
     fn last_log_index(&self) -> usize {
         self.log.len() - 1
     }
 
-    fn last_log_term(&self) -> u64 {
-        self.log[self.last_log_index()]
-            .as_ref()
-            .map(|(_, term)| *term)
-            .unwrap_or(0)
+    fn log_term_at(&self, idx: usize) -> u64 {
+        self.log[idx].as_ref().map(|(_, term)| *term).unwrap_or(0)
     }
 
     fn delay_election(&self) {
@@ -127,60 +130,82 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
 
     fn update_term(&mut self, term: u64) {
         self.current_term = term;
-        self.is_leader = false;
         self.votes.clear();
+        self.next_index.clear();
+        self.match_index.clear();
         // Voted for no one in this new term
         self.voted_for = None;
     }
 
-    /// Request to append entry to the log
-    pub fn request(&mut self, entry: Entry) -> anyhow::Result<()> {
-        todo!()
+    fn send_append_entries(&mut self, dest: String, network: &mut Network) -> anyhow::Result<()> {
+        let next_index = self.next_index[&dest];
+        let entries = self.log[next_index..]
+            .iter()
+            .map(|e| e.clone().expect("Only the 0th element should be None"))
+            .collect();
+
+        network
+            .send(
+                dest,
+                Body {
+                    msg_id: self.msg_id.next(),
+                    in_reply_to: None,
+                    payload: RaftPayload::AppendEntries {
+                        term: self.current_term,
+                        prev_log_index: next_index - 1,
+                        prev_log_term: self.log[next_index - 1]
+                            .as_ref()
+                            .map(|(_, term)| *term)
+                            .unwrap_or(0),
+                        entries,
+                        leader_commit: self.commit_index,
+                    },
+                },
+            )
+            .context("Send append entries")
     }
 
-    pub fn step(&mut self, event: Event<()>, network: &mut Network) -> anyhow::Result<()> {
+    /// Request to append entry to the log
+    pub fn request(&mut self, entry: Entry, node_id: &str) -> anyhow::Result<()> {
+        if !self.is_leader() {
+            return Ok(());
+        }
+
+        self.log.push(Some((entry, self.current_term)));
+        *self
+            .match_index
+            .get_mut(node_id)
+            .expect("Leader should have itself in match_index") += 1;
+
+        Ok(())
+    }
+
+    pub fn step(
+        &mut self,
+        event: Event<(), (), Entry>,
+        network: &mut Network,
+    ) -> anyhow::Result<()> {
         match event {
             Event::EOF => todo!(),
             Event::RaftSignal(signal) => match signal {
                 RaftSignal::Heartbeat => {
                     // If leader, send append entries
-                    if !self.is_leader {
+                    if !self.is_leader() {
                         return Ok(());
                     }
 
                     eprintln!("{} sending heartbeats", network.node_id);
-                    for (follower, &next_index) in self.next_index.iter() {
-                        if follower == &network.node_id {
+                    for follower in network.all_nodes.clone() {
+                        if follower == network.node_id {
                             continue;
                         }
 
-                        let entries = self.log[next_index..]
-                            .iter()
-                            .map(|e| e.clone().expect("Only the 0th element should be None"))
-                            .collect();
-
-                        network
-                            .send(
-                                follower.to_string(),
-                                Body {
-                                    msg_id: self.msg_id.next(),
-                                    in_reply_to: None,
-                                    payload: RaftPayload::AppendEntries {
-                                        term: self.current_term,
-                                        prev_log_index: next_index - 1,
-                                        prev_log_term: self.log[next_index - 1]
-                                            .as_ref()
-                                            .map(|(_, term)| *term)
-                                            .unwrap_or(0),
-                                        entries,
-                                    },
-                                },
-                            )
-                            .context("Send append entries")?;
+                        self.send_append_entries(follower, network)
+                            .context("Heartbeat send append entries")?;
                     }
                 }
                 RaftSignal::Campaign => {
-                    if self.is_leader {
+                    if self.is_leader() {
                         return Ok(());
                     }
 
@@ -210,7 +235,7 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                                     payload: RaftPayload::<Entry>::RequestVote {
                                         term: self.current_term,
                                         last_log_index: self.last_log_index(),
-                                        last_log_term: self.last_log_term(),
+                                        last_log_term: self.log_term_at(self.last_log_index()),
                                     },
                                 },
                             )
@@ -235,7 +260,10 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                     let granted = term >= self.current_term
                         && !self.voted_for.as_ref().is_some_and(|v| v != &msg.src)
                         && (last_log_term, last_log_index)
-                            >= (self.last_log_term(), self.last_log_index());
+                            >= (
+                                self.log_term_at(self.last_log_index()),
+                                self.last_log_index(),
+                            );
 
                     if granted {
                         self.update_term(term);
@@ -268,39 +296,141 @@ impl<Entry: Clone + Serialize> RaftService<Entry> {
                         self.votes.insert(msg.src);
                     }
 
-                    if self.votes.len() > network.all_nodes.len() / 2 && !self.is_leader {
+                    if self.votes.len() > network.all_nodes.len() / 2 && !self.is_leader() {
                         eprintln!(
                             "{} has been elected as leader in term {term}",
                             network.node_id
                         );
 
+                        self.next_index = network
+                            .all_nodes
+                            .iter()
+                            .cloned()
+                            .map(|n| (n, self.last_log_index() + 1))
+                            .collect();
+
+                        self.match_index =
+                            network.all_nodes.iter().cloned().map(|n| (n, 0)).collect();
+
                         // Send inital heartbeat as soon as elected
                         self.step(Event::RaftSignal(RaftSignal::Heartbeat), network)
                             .context("Heartbeat on elected")?;
-
-                        self.is_leader = true;
                     }
                 }
                 RaftPayload::AppendEntries {
                     term,
                     prev_log_index,
                     prev_log_term,
-                    entries,
+                    mut entries,
+                    leader_commit,
                 } => {
                     if term >= self.current_term {
                         // Must be from a new leader
                         self.update_term(term);
                         self.voted_for = Some(msg.src.clone());
+                        self.delay_election();
                     }
 
                     if term < self.current_term
-                        || !self.voted_for.as_ref().is_some_and(|v| v == &msg.src)
+                        || self.last_log_index() < prev_log_index
+                        || self.log_term_at(prev_log_index) != prev_log_term
                     {
+                        network
+                            .reply(
+                                msg.src,
+                                self.msg_id.next(),
+                                msg.body.msg_id,
+                                RaftPayload::<Entry>::AppendEntriesOk {
+                                    term: self.current_term,
+                                    success: false,
+                                    applied_up_to: self.last_log_index(),
+                                },
+                            )
+                            .context("Append entries rejection")?;
                         return Ok(());
                     }
 
-                    self.delay_election();
-                    eprintln!("got heartbeat from {}", msg.src);
+                    eprintln!("got appendEntries from {}:{:?}", msg.src, &entries);
+
+                    for i in prev_log_index + 1
+                        ..std::cmp::min(prev_log_index + 1 + entries.len(), self.log.len())
+                    {
+                        if self.log_term_at(i) != entries[0].1 {
+                            // Conflicting entries
+                            // so remove everything from this point on
+                            self.log.drain(i..);
+                            break;
+                        }
+                        entries.remove(0);
+                    }
+
+                    self.log.extend(entries.into_iter().map(Some));
+
+                    self.commit_index = std::cmp::max(
+                        self.commit_index,
+                        std::cmp::min(leader_commit, self.last_log_index()),
+                    );
+
+                    network
+                        .reply(
+                            msg.src,
+                            self.msg_id.next(),
+                            msg.body.msg_id,
+                            RaftPayload::<Entry>::AppendEntriesOk {
+                                term: self.current_term,
+                                success: true,
+                                applied_up_to: self.last_log_index(),
+                            },
+                        )
+                        .context("Append entries acceptance")?;
+                }
+                RaftPayload::AppendEntriesOk {
+                    term,
+                    success,
+                    applied_up_to,
+                } => {
+                    if term > self.current_term {
+                        self.update_term(term);
+                        return Ok(());
+                    }
+
+                    // Should never have term < current_term
+                    // Since follower updated their term to leader's
+                    // On AppendEntries, thus this message is too delayed
+                    if term < self.current_term {
+                        return Ok(());
+                    }
+
+                    *self
+                        .next_index
+                        .get_mut(&msg.src)
+                        .expect("Leader should have all nodes in next_index") = applied_up_to + 1;
+
+                    *self
+                        .match_index
+                        .get_mut(&msg.src)
+                        .expect("Leader should have all nodes in match_index") = applied_up_to;
+
+                    if success {
+                        let mut counts = HashMap::new();
+
+                        for &e in self.match_index.values() {
+                            *counts.entry(e).or_insert(0) += 1
+                        }
+
+                        let half_nodes = network.all_nodes.len() / 2;
+                        self.commit_index = counts
+                            .into_iter()
+                            .filter(|(_, c)| c > &half_nodes)
+                            .map(|(v, _)| v)
+                            .max()
+                            .unwrap_or(0);
+
+                        eprintln!("Commited up to {}", self.commit_index);
+                    } else {
+                        self.send_append_entries(msg.src, network)
+                            .context("Append entries retry")?;
+                    }
                 }
             },
 

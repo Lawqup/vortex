@@ -150,6 +150,12 @@ impl IdCounter {
     }
 }
 
+impl Default for IdCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub trait Service<Payload, Signal = ()>: Sized
 where
     Payload: DeserializeOwned + Send + Clone + 'static,
@@ -204,7 +210,7 @@ where
                     _ => bail!("Got local event over the network"),
                 };
 
-                if let Err(_) = sender_clone.send(event) {
+                if sender_clone.send(event).is_err() {
                     return Ok::<_, anyhow::Error>(());
                 }
             }
