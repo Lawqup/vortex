@@ -44,7 +44,7 @@ struct LogService {
 
 impl Service<LogPayload, (), RaftEntry> for LogService {
     fn create(network: &mut Network, sender: mpsc::Sender<E>) -> Self {
-        let raft = RaftService::create(sender.map_input(E::Raft));
+        let raft = RaftService::create(network, sender.map_input(E::Raft));
 
         network.set_mesh_topology();
         Self {
@@ -89,7 +89,7 @@ impl Service<LogPayload, (), RaftEntry> for LogService {
                     self.raft
                         .request(
                             (message.src, message.body.msg_id, key.clone(), msg),
-                            &network.node_id,
+                            network,
                         )
                         .context("Requesting raft")?;
                 }

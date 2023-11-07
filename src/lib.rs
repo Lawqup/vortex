@@ -133,6 +133,10 @@ impl Network {
     pub fn set_mesh_topology(&mut self) {
         self.neighbors = self.all_nodes.clone();
     }
+
+    pub fn is_singleton(&self) -> bool {
+        self.all_nodes.len() == 1
+    }
 }
 
 pub struct IdCounter(u64);

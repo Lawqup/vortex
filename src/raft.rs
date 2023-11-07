@@ -84,33 +84,11 @@ pub struct RaftService<Entry: Clone> {
 }
 
 impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
-    pub fn create(sender: impl SenderExt<RaftEvent<Entry>> + Clone) -> Self {
-        // Between 150 and 300 as per Raft spec
-        let election_timeout = Duration::from_millis(rand::thread_rng().gen_range(150..=300));
-        let heartbeat_timeout = Duration::from_millis(150);
-
+    pub fn create(network: &mut Network, sender: impl SenderExt<RaftEvent<Entry>> + Clone) -> Self {
         let reset_election_timer = Arc::new(AtomicBool::new(false));
         let sender_clone = sender.clone();
-        spawn_timer(
-            Box::new(move || {
-                let _ = sender_clone.send(RaftEvent::RaftSignal(RaftSignal::Campaign));
-                Ok(())
-            }),
-            election_timeout,
-            Some(reset_election_timer.clone()),
-        );
 
-        let sender_clone = sender.clone();
-        spawn_timer(
-            Box::new(move || {
-                let _ = sender_clone.send(RaftEvent::RaftSignal(RaftSignal::Heartbeat));
-                Ok(())
-            }),
-            heartbeat_timeout,
-            None,
-        );
-
-        Self {
+        let mut node = Self {
             msg_id: IdCounter::new(),
             log: vec![None],
             commit_index: 0,
@@ -119,9 +97,43 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             votes: HashSet::new(),
-            reset_election_timer,
-            log_sender: Box::new(sender.map_input(RaftEvent::CommitedEntry)),
+            reset_election_timer: reset_election_timer.clone(),
+            log_sender: Box::new(sender_clone.map_input(RaftEvent::CommitedEntry)),
+        };
+
+        // No need to worry about silly things like consensus in singleton mode
+        if network.is_singleton() {
+            // Make sure we're considered leader still
+            node.next_index.insert(network.node_id.clone(), 1);
+            node.match_index.insert(network.node_id.clone(), 0);
+            return node;
         }
+
+        // Between 150 and 300 as per Raft spec
+        let election_timeout = Duration::from_millis(rand::thread_rng().gen_range(150..=300));
+        let heartbeat_timeout = Duration::from_millis(150);
+
+        let sender_clone = sender.clone();
+
+        spawn_timer(
+            Box::new(move || {
+                let _ = sender_clone.send(RaftEvent::RaftSignal(RaftSignal::Campaign));
+                Ok(())
+            }),
+            election_timeout,
+            Some(reset_election_timer),
+        );
+
+        spawn_timer(
+            Box::new(move || {
+                let _ = sender.send(RaftEvent::RaftSignal(RaftSignal::Heartbeat));
+                Ok(())
+            }),
+            heartbeat_timeout,
+            None,
+        );
+
+        node
     }
 
     fn is_leader(&self) -> bool {
@@ -178,7 +190,7 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
     }
 
     /// Request to append entry to the log
-    pub fn request(&mut self, entry: Entry, node_id: &str) -> anyhow::Result<()> {
+    pub fn request(&mut self, entry: Entry, network: &mut Network) -> anyhow::Result<()> {
         if !self.is_leader() {
             return Ok(());
         }
@@ -186,8 +198,18 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
         self.log.push(Some((entry, self.current_term)));
         *self
             .match_index
-            .get_mut(node_id)
-            .expect("Leader should have itself in match_index") += 1;
+            .get_mut(&network.node_id)
+            .expect("Node should have itself in match_index") += 1;
+
+        if network.is_singleton() {
+            *self
+                .next_index
+                .get_mut(&network.node_id)
+                .expect("Node should have itself in next_index") += 1;
+
+            // As singleton we can immediately commit
+            self.commit(self.commit_index + 1);
+        }
 
         Ok(())
     }
@@ -215,7 +237,6 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
 
                     eprintln!("{} sending heartbeats", network.node_id);
                     for follower in network.all_nodes.clone() {
-                        // TODO: singelton case
                         if follower == network.node_id {
                             continue;
                         }
@@ -240,21 +261,6 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                     self.voted_for = Some(network.node_id.clone());
                     self.votes.insert(network.node_id.clone());
                     self.delay_election();
-
-                    // TODO: singelton case
-                    // if network.all_nodes.len() == 1 {
-                    //     self.next_index = network
-                    //         .all_nodes
-                    //         .iter()
-                    //         .cloned()
-                    //         .map(|n| (n, self.last_log_index() + 1))
-                    //         .collect();
-
-                    //     self.match_index =
-                    //         network.all_nodes.iter().cloned().map(|n| (n, 0)).collect();
-
-                    //     return Ok(());
-                    // }
 
                     for other in network.all_nodes.clone() {
                         if other == network.node_id {
