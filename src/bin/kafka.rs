@@ -157,7 +157,7 @@ impl Service<LogPayload, (), RaftEntry> for LogService {
 }
 
 fn main() -> anyhow::Result<()> {
-    LogService::run().context("Run generate service")
+    LogService::run().context("Run log service")
 }
 
 pub struct Log {

@@ -44,6 +44,7 @@ pub enum RaftPayload<Entry = ()> {
         /// Last index that was applied in the AppendEntries
         applied_up_to: usize,
     },
+    Forward(Entry),
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -177,10 +178,7 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                     payload: RaftPayload::AppendEntries {
                         term: self.current_term,
                         prev_log_index: next_index - 1,
-                        prev_log_term: self.log[next_index - 1]
-                            .as_ref()
-                            .map(|(_, term)| *term)
-                            .unwrap_or(0),
+                        prev_log_term: self.log_term_at(next_index - 1),
                         entries,
                         leader_commit: self.commit_index,
                     },
@@ -192,6 +190,19 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
     /// Request to append entry to the log
     pub fn request(&mut self, entry: Entry, network: &mut Network) -> anyhow::Result<()> {
         if !self.is_leader() {
+            if let Some(leader) = &self.voted_for {
+                eprintln!("Forwarding {entry:?}");
+                network
+                    .send(
+                        leader.clone(),
+                        Body {
+                            msg_id: self.msg_id.next(),
+                            in_reply_to: None,
+                            payload: RaftPayload::Forward(entry),
+                        },
+                    )
+                    .context("Forward raft entry")?;
+            }
             return Ok(());
         }
 
@@ -223,7 +234,7 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
             }
         }
 
-        eprintln!("Commited entries {}-{}", prev + 1, self.commit_index);
+        eprintln!("Committed entries {}-{}", prev + 1, self.commit_index);
     }
 
     pub fn step(&mut self, event: RaftEvent<Entry>, network: &mut Network) -> anyhow::Result<()> {
@@ -367,6 +378,8 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                     leader_commit,
                 } => {
                     if term >= self.current_term {
+                        eprintln!("got appendEntries from {}", msg.src);
+
                         // Must be from a new leader
                         self.update_term(term);
                         self.voted_for = Some(msg.src.clone());
@@ -391,8 +404,6 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                             .context("Append entries rejection")?;
                         return Ok(());
                     }
-
-                    eprintln!("got appendEntries from {}:{:?}", msg.src, &entries);
 
                     for i in prev_log_index + 1
                         ..std::cmp::min(prev_log_index + 1 + entries.len(), self.log.len())
@@ -438,6 +449,10 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                         return Ok(());
                     }
 
+                    if !self.is_leader() {
+                        return Ok(());
+                    }
+
                     // Should never have term < current_term
                     // Since follower updated their term to leader's
                     // On AppendEntries, thus this message is too delayed
@@ -476,6 +491,9 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                         self.send_append_entries(msg.src, network)
                             .context("Append entries retry")?;
                     }
+                }
+                RaftPayload::Forward(ent) => {
+                    self.request(ent, network).context("Forwarded request")?;
                 }
             },
             RaftEvent::CommitedEntry(_) => bail!("Commited entry should be handled by Raft client"),
