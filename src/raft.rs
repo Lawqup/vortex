@@ -44,7 +44,6 @@ pub enum RaftPayload<Entry = ()> {
         /// Last index that was applied in the AppendEntries
         applied_up_to: usize,
     },
-    Forward(Entry),
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -137,8 +136,33 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
         node
     }
 
-    fn is_leader(&self) -> bool {
+    pub fn become_leader(&mut self, network: &mut Network) -> anyhow::Result<()> {
+        eprintln!(
+            "{} has been elected as leader in term {}",
+            network.node_id, self.current_term
+        );
+
+        self.next_index = network
+            .all_nodes
+            .iter()
+            .cloned()
+            .map(|n| (n, self.last_log_index() + 1))
+            .collect();
+
+        self.match_index = network.all_nodes.iter().cloned().map(|n| (n, 0)).collect();
+
+        // Send inital heartbeat as soon as elected
+        self.step(RaftEvent::RaftSignal(RaftSignal::Heartbeat), network)
+            .context("Heartbeat on elected")
+    }
+
+    pub fn is_leader(&self) -> bool {
         !self.next_index.is_empty()
+    }
+
+    /// Fallible
+    pub fn voted_for(&self) -> Option<String> {
+        self.voted_for.clone()
     }
 
     fn last_log_index(&self) -> usize {
@@ -190,19 +214,6 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
     /// Request to append entry to the log
     pub fn request(&mut self, entry: Entry, network: &mut Network) -> anyhow::Result<()> {
         if !self.is_leader() {
-            if let Some(leader) = &self.voted_for {
-                eprintln!("Forwarding {entry:?}");
-                network
-                    .send(
-                        leader.clone(),
-                        Body {
-                            msg_id: self.msg_id.next(),
-                            in_reply_to: None,
-                            payload: RaftPayload::Forward(entry),
-                        },
-                    )
-                    .context("Forward raft entry")?;
-            }
             return Ok(());
         }
 
@@ -350,24 +361,8 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                     }
 
                     if self.votes.len() > network.all_nodes.len() / 2 && !self.is_leader() {
-                        eprintln!(
-                            "{} has been elected as leader in term {term}",
-                            network.node_id
-                        );
-
-                        self.next_index = network
-                            .all_nodes
-                            .iter()
-                            .cloned()
-                            .map(|n| (n, self.last_log_index() + 1))
-                            .collect();
-
-                        self.match_index =
-                            network.all_nodes.iter().cloned().map(|n| (n, 0)).collect();
-
-                        // Send inital heartbeat as soon as elected
-                        self.step(RaftEvent::RaftSignal(RaftSignal::Heartbeat), network)
-                            .context("Heartbeat on elected")?;
+                        self.become_leader(network)
+                            .context("Become leader on majority")?;
                     }
                 }
                 RaftPayload::AppendEntries {
@@ -424,7 +419,7 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                         std::cmp::min(leader_commit, self.last_log_index()),
                     );
 
-                    self.commit(new_idx);
+                    self.commit(dbg!(new_idx));
 
                     network
                         .reply(
@@ -486,14 +481,11 @@ impl<Entry: Clone + Serialize + fmt::Debug + 'static> RaftService<Entry> {
                             .max()
                             .unwrap_or(0);
 
-                        self.commit(new_idx);
+                        self.commit(dbg!(new_idx));
                     } else {
                         self.send_append_entries(msg.src, network)
                             .context("Append entries retry")?;
                     }
-                }
-                RaftPayload::Forward(ent) => {
-                    self.request(ent, network).context("Forwarded request")?;
                 }
             },
             RaftEvent::CommitedEntry(_) => bail!("Commited entry should be handled by Raft client"),

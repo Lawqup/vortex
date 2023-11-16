@@ -1,10 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::bail;
 use serde::de::Error;
 use serde::ser::{SerializeSeq, SerializeTuple};
 use serde::Deserializer;
-use ulid::Ulid;
 use vortex::*;
 
 #[derive(Debug, Clone)]
@@ -93,22 +92,18 @@ impl Serialize for OperationOk {
 enum KVPayload {
     Txn { txn: Vec<Operation> },
     TxnOk { txn: Vec<OperationOk> },
-    Applied { applied: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct RaftEntry {
     client: String,
     in_reply_to: Option<u64>,
-    id: String,
     txn: Vec<Operation>,
 }
 
 struct KVService {
     msg_id: IdCounter,
     store: HashMap<i64, i64>,
-    pending_replies: HashMap<String, (String, Option<u64>, KVPayload)>,
-    who_applied: HashMap<String, HashSet<String>>,
     raft: RaftService<RaftEntry>,
 }
 
@@ -116,14 +111,16 @@ type E = Event<KVPayload, (), RaftEntry>;
 
 impl Service<KVPayload, (), RaftEntry> for KVService {
     fn create(network: &mut Network, sender: std::sync::mpsc::Sender<E>) -> Self {
-        let raft = RaftService::create(network, sender.map_input(E::Raft));
+        let mut raft = RaftService::create(network, sender.map_input(E::Raft));
+
+        if network.node_id == "n0" {
+            let _ = raft.become_leader(network);
+        }
 
         network.set_mesh_topology();
         Self {
             msg_id: IdCounter::new(),
             store: HashMap::new(),
-            pending_replies: HashMap::new(),
-            who_applied: HashMap::new(),
             raft,
         }
     }
@@ -140,7 +137,6 @@ impl Service<KVPayload, (), RaftEntry> for KVService {
                 RaftEvent::CommitedEntry(RaftEntry {
                     client,
                     in_reply_to,
-                    id,
                     txn,
                 }) => {
                     let mut res = Vec::new();
@@ -156,74 +152,47 @@ impl Service<KVPayload, (), RaftEntry> for KVService {
                             }
                         }
                     }
-                    eprintln!("STORE {:?}", self.store);
+                    eprintln!("REPLYING");
 
-                    self.pending_replies.insert(
-                        id.clone(),
-                        (client, in_reply_to, KVPayload::TxnOk { txn: res }),
-                    );
-
-                    let mut set = HashSet::new();
-                    set.insert(network.node_id.clone());
-
-                    self.who_applied.insert(id.clone(), set);
-
-                    for other in network.all_nodes.clone() {
-                        if other == network.node_id {
-                            continue;
-                        }
-
-                        network
-                            .send(
-                                other,
-                                Body {
-                                    msg_id: self.msg_id.next(),
-                                    in_reply_to: None,
-                                    payload: KVPayload::Applied {
-                                        applied: id.clone(),
-                                    },
-                                },
-                            )
-                            .context("Send applied kv")?;
-                    }
+                    network
+                        .reply(
+                            client,
+                            self.msg_id.next(),
+                            in_reply_to,
+                            KVPayload::TxnOk { txn: res },
+                        )
+                        .context("Transaction reply")?;
                 }
             },
             Event::Message(msg) => match msg.body.payload {
-                KVPayload::Txn { txn } => {
-                    self.raft
-                        .request(
-                            RaftEntry {
-                                client: msg.src,
-                                in_reply_to: msg.body.msg_id,
-                                id: Ulid::new().to_string(),
-                                txn,
-                            },
-                            network,
-                        )
-                        .context("Requesting raft")?;
-                }
-                KVPayload::TxnOk { .. } => bail!("Unexpected msg variant"),
-                KVPayload::Applied { applied } => {
-                    self.who_applied
-                        .entry(applied.clone())
-                        .or_insert(HashSet::new())
-                        .insert(msg.src);
+                KVPayload::Txn { ref txn } => {
+                    if self.raft.is_leader() {
+                        eprintln!("REQUESTING");
+                        self.raft
+                            .request(
+                                RaftEntry {
+                                    client: msg.src,
+                                    in_reply_to: msg.body.msg_id,
+                                    txn: txn.clone(),
+                                },
+                                network,
+                            )
+                            .context("Requesting raft")?;
+                    } else if let Some(voted_for) = self.raft.voted_for() {
+                        // Not leader, but voted for self (ie campaigning)
+                        if voted_for == network.node_id {
+                            return Ok(());
+                        }
 
-                    if self.who_applied[&applied].len() == network.all_nodes.len() {
-                        let (client, in_reply_to, payload) = self
-                            .pending_replies
-                            .remove(&applied)
-                            .expect("All nodes, including this, have pending");
-
-                        self.who_applied.remove(&applied);
-
-                        eprintln!("Responding: {payload:?}");
-
-                        network
-                            .reply(client, self.msg_id.next(), in_reply_to, payload)
-                            .context("Transaction reply")?;
+                        eprintln!("FORWARDING");
+                        let fwd = Message {
+                            dest: voted_for,
+                            ..msg
+                        };
+                        network.send_msg(fwd).context("Forward to leader")?;
                     }
                 }
+                KVPayload::TxnOk { .. } => bail!("Unexpected msg variant"),
             },
             Event::EOF | Event::Signal(_) => bail!("Unexpected event"),
         }

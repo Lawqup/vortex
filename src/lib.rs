@@ -89,13 +89,22 @@ impl Network {
         dest: String,
         body: Body<Payload>,
     ) -> anyhow::Result<()> {
-        let reply = Message {
+        let msg = Message {
             src: self.node_id.clone(),
             dest,
             body,
         };
 
-        serde_json::to_writer(&mut self.output, &reply).context("Serialize message")?;
+        serde_json::to_writer(&mut self.output, &msg).context("Serialize message")?;
+        self.output.write_all(b"\n")?;
+        Ok(())
+    }
+
+    pub fn send_msg<Payload: Serialize + Clone>(
+        &mut self,
+        msg: Message<Payload>,
+    ) -> anyhow::Result<()> {
+        serde_json::to_writer(&mut self.output, &msg).context("Serialize message")?;
         self.output.write_all(b"\n")?;
         Ok(())
     }
