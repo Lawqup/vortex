@@ -26,9 +26,8 @@ impl Service<EchoPayload> for EchoService {
             panic!("Echo should only recieve messages");
         };
 
-        let echo = match &input.body.payload {
-            EchoPayload::Echo { echo } => echo,
-            _ => return Ok(()),
+        let EchoPayload::Echo { echo } = &input.body.payload else {
+            return Ok(());
         };
 
         network

@@ -85,9 +85,14 @@ impl Service<CounterPayload, BroadcastSignal> for CounterService {
                         // already known to let A know B knows
 
                         let mut rng = rand::thread_rng();
-                        to_send.extend(known.iter().cloned().filter(|_| {
-                            rng.gen_ratio(10.min(known.len() as u32), known.len() as u32)
-                        }));
+                        to_send.extend(
+                            known
+                                .iter()
+                                .filter(|_| {
+                                    rng.gen_ratio(10.min(known.len() as u32), known.len() as u32)
+                                })
+                                .cloned(),
+                        );
 
                         let deltas = to_send
                             .into_iter()

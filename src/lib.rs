@@ -154,13 +154,18 @@ impl IdCounter {
     pub fn new() -> Self {
         Self(0)
     }
-    pub fn next(&mut self) -> Option<u64> {
+    pub fn peek(&mut self) -> u64 {
+        self.0
+    }
+}
+
+impl Iterator for IdCounter {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
         let prev = self.0;
         self.0 += 1;
         Some(prev)
-    }
-    pub fn peek(&mut self) -> u64 {
-        self.0
     }
 }
 

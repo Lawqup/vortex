@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::mpsc};
 
-use anyhow;
 use vortex::*;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -68,7 +67,7 @@ impl Service<LogPayload, (), RaftEntry> for LogService {
                     RaftEvent::CommitedEntry((client, in_response_to, key, msg)) => {
                         // Finally reply to client
 
-                        let log = self.logs.entry(key).or_insert(Log::new());
+                        let log = self.logs.entry(key).or_default();
 
                         network
                             .reply(
@@ -165,6 +164,12 @@ pub struct Log {
     entries: Vec<Option<u64>>,
 }
 
+impl Default for Log {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Log {
     pub fn new() -> Self {
         Self {
@@ -180,7 +185,7 @@ impl Log {
 
     pub fn poll(&self, from: usize) -> Vec<(usize, u64)> {
         (from..)
-            .zip(self.entries[from..].into_iter().copied())
+            .zip(self.entries[from..].iter().copied())
             .filter_map(|(i, e)| e.map(|ofs| (i, ofs)))
             .collect()
     }
