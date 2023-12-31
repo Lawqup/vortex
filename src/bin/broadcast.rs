@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{self, bail};
 use rand::Rng;
-use vortex::*;
+use vortex_raft::*;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(tag = "type")]

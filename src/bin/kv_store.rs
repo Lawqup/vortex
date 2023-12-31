@@ -4,7 +4,7 @@ use anyhow::bail;
 use serde::de::Error;
 use serde::ser::{SerializeSeq, SerializeTuple};
 use serde::Deserializer;
-use vortex::*;
+use vortex_raft::*;
 
 #[derive(Debug, Clone)]
 enum Operation {

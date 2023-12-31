@@ -18,7 +18,7 @@ First, [[https://github.com/jepsen-io/maelstrom/releases/][install Maelstrom]] t
 Messages are expected to be in the format Maelstrom provides, so all you need to specify is the payload (for both incoming and outgoing messages):
 
 #+begin_src rust
-  use vortex::*;
+  use vortex_raft::*;
 
   #[derive(Debug, Deserialize, Serialize, Clone)]
   #[serde(tag = "type")]
